@@ -23,10 +23,12 @@ use lunaris_ai_core::provider::AIProvider;
 use lunaris_ai_daemon::authz::AuthorizationStore;
 use lunaris_ai_daemon::config_watch;
 use lunaris_ai_daemon::graph_adapter::OsSdkGraphQuerier;
+use lunaris_ai_daemon::mcp_discovery::McpDiscovery;
 use lunaris_ai_daemon::peer::{self, PeerError};
 use lunaris_ai_daemon::registry::{AuthError, CompletionOutcome};
 use lunaris_ai_daemon::service::{AiDaemonService, QueryError};
 use lunaris_ai_providers::proxied::{ProxiedConfig, ProxiedProvider};
+use os_sdk::UnixEventConsumer;
 use zbus::Connection;
 
 const BUS_NAME: &str = "org.lunaris.AI1";
@@ -54,6 +56,27 @@ fn resolve_knowledge_socket() -> String {
         }
     }
     "/run/lunaris/knowledge.sock".to_string()
+}
+
+/// Resolve the Event Bus consumer socket the same way: an explicit
+/// `LUNARIS_CONSUMER_SOCKET` override wins; otherwise the per-user
+/// runtime path is used when it exists; the system path is the
+/// final fallback.
+fn resolve_event_consumer_socket() -> String {
+    if let Ok(explicit) = std::env::var("LUNARIS_CONSUMER_SOCKET") {
+        if !explicit.is_empty() {
+            return explicit;
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        if !xdg.is_empty() {
+            let runtime = format!("{xdg}/lunaris/event-bus-consumer.sock");
+            if std::path::Path::new(&runtime).exists() {
+                return runtime;
+            }
+        }
+    }
+    "/run/lunaris/event-bus-consumer.sock".to_string()
 }
 
 #[tokio::main]
@@ -145,6 +168,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     connection.request_name(BUS_NAME).await?;
 
     tracing::info!(bus = BUS_NAME, path = OBJECT_PATH, "lunaris-ai-daemon serving");
+
+    // Discover Tier-1 module MCP servers over the Event Bus `module.`
+    // namespace. `run` subscribes (retrying if the bus is late),
+    // reconciles against the sockets already on disk, and tracks
+    // installs and removals for the rest of the session.
+    let discovery = Arc::new(McpDiscovery::new());
+    let consumer = UnixEventConsumer::new(resolve_event_consumer_socket());
+    tokio::spawn(discovery.run(consumer));
 
     tokio::signal::ctrl_c().await?;
     tracing::info!("lunaris-ai-daemon shutting down");

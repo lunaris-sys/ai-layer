@@ -18,6 +18,7 @@
 pub mod authz;
 pub mod config_watch;
 pub mod graph_adapter;
+pub mod mcp_discovery;
 pub mod peer;
 pub mod registry;
 pub mod service;

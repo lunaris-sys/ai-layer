@@ -1070,6 +1070,7 @@ dependencies = [
  "hex",
  "lunaris-ai-core",
  "lunaris-ai-providers",
+ "lunaris-permissions",
  "os-sdk",
  "rand 0.8.6",
  "serde",
@@ -1124,6 +1125,18 @@ dependencies = [
  "url",
  "wiremock",
  "zbus",
+]
+
+[[package]]
+name = "lunaris-permissions"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "libc",
+ "notify",
+ "serde",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
@@ -1254,6 +1267,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "libc",
+ "lunaris-permissions",
  "notify",
  "prost",
  "prost-build",

@@ -15,6 +15,9 @@ path = "src/lib.rs"
 lunaris-ai-core = { path = "../ai-core" }
 lunaris-ai-providers = { path = "../ai-providers" }
 os-sdk = { path = "../../sdk/os-sdk" }
+# MCP discovery resolves the peer of each module socket to verify it
+# is served by modulesd; identity resolution lives here.
+lunaris-permissions = { path = "../../sdk/permissions" }
 async-trait = "0.1"
 hex = "0.4"
 rand = "0.8"
