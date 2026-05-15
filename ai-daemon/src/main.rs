@@ -20,6 +20,7 @@ use lunaris_ai_core::graph_query::{AccessTier, QueryScope};
 use lunaris_ai_core::graph_schema::GraphSchema;
 use lunaris_ai_core::pipeline::{CypherPipeline, GraphQuerier, QueryRunner};
 use lunaris_ai_core::provider::AIProvider;
+use lunaris_ai_daemon::authz::AuthorizationStore;
 use lunaris_ai_daemon::config_watch;
 use lunaris_ai_daemon::graph_adapter::OsSdkGraphQuerier;
 use lunaris_ai_daemon::peer::{self, PeerError};
@@ -126,8 +127,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is fine because ctrl_c().await is the only exit path.
     let _sweep = service.spawn_sweep_task();
 
+    // Per-session authorization for MCP action servers. Grants live
+    // here only; nothing is persisted, and the store is dropped with
+    // the process at session end.
+    let authz = Arc::new(AuthorizationStore::new());
+
     let dbus = AiInterface {
         service: service.clone(),
+        authz: authz.clone(),
     };
 
     // Register the interface, then claim the well-known name on the
@@ -147,6 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// D-Bus surface (`org.lunaris.AI1`).
 struct AiInterface {
     service: Arc<AiDaemonService>,
+    authz: Arc<AuthorizationStore>,
 }
 
 #[zbus::interface(name = "org.lunaris.AI1")]
@@ -233,6 +241,77 @@ impl AiInterface {
     fn enabled(&self) -> bool {
         self.service.is_enabled()
     }
+
+    /// Answer an open authorization prompt.
+    ///
+    /// Only the desktop shell may call this: the `AuthorizationPrompt`
+    /// signal that carries a prompt id is a session-bus broadcast, so
+    /// without a caller check any peer that observed the id could
+    /// approve a scope itself. The caller's executable is resolved
+    /// and checked against the trusted shell binary before the
+    /// decision is recorded.
+    ///
+    /// Returns `true` if a matching pending prompt existed.
+    async fn respond_authorization(
+        &self,
+        prompt_id: &str,
+        granted: bool,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+    ) -> zbus::fdo::Result<bool> {
+        let caller = peer::resolve(&header, connection)
+            .await
+            .map_err(map_peer_error)?;
+        if !is_trusted_shell(&caller.stable_id) {
+            return Err(zbus::fdo::Error::AccessDenied(
+                "only the desktop shell may answer authorization prompts"
+                    .to_string(),
+            ));
+        }
+        match uuid::Uuid::parse_str(prompt_id) {
+            Ok(id) => Ok(self.authz.resolve(id, granted).await),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Emitted when a scope needs the user's authorization. The
+    /// payload is only a prompt id and a scope label, never query
+    /// content. The prompt id is not a bearer token: a response is
+    /// authorised by the caller's identity in `respond_authorization`,
+    /// not by knowing the id. Phase 9-δ's tool dispatch emits this
+    /// once it can request authorization for a real tool call.
+    #[zbus(signal)]
+    async fn authorization_prompt(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        prompt_id: &str,
+        scope: &str,
+    ) -> zbus::Result<()>;
+}
+
+/// Canonical install paths of the desktop shell binary. Only a
+/// process running one of these may answer authorization prompts.
+const TRUSTED_SHELL_BINS: &[&str] = &[
+    "/usr/bin/lunaris-desktop-shell",
+    "/usr/lib/lunaris/libexec/lunaris-desktop-shell",
+];
+
+/// Whether `exe_path` is the trusted desktop shell.
+///
+/// In debug builds a `LUNARIS_AI_TRUSTED_SHELL_BIN` env var adds a
+/// dev path (the repo-relative `cargo tauri dev` binary). The
+/// override is compiled out of release builds so it cannot become
+/// part of the production trust boundary.
+fn is_trusted_shell(exe_path: &str) -> bool {
+    if TRUSTED_SHELL_BINS.contains(&exe_path) {
+        return true;
+    }
+    #[cfg(debug_assertions)]
+    if let Ok(dev) = std::env::var("LUNARIS_AI_TRUSTED_SHELL_BIN") {
+        if !dev.is_empty() && dev == exe_path {
+            return true;
+        }
+    }
+    false
 }
 
 fn sender(header: &zbus::message::Header<'_>) -> zbus::fdo::Result<String> {

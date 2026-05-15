@@ -12,6 +12,7 @@
 pub mod cypher;
 pub mod graph_query;
 pub mod graph_schema;
+pub mod mcp;
 pub mod pipeline;
 pub mod provider;
 pub mod routing;

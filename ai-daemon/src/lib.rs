@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod authz;
 pub mod config_watch;
 pub mod graph_adapter;
 pub mod peer;
