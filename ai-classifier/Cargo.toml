@@ -1,0 +1,12 @@
+[package]
+name = "lunaris-ai-classifier"
+version = "0.1.0"
+edition = "2021"
+description = "ONNX-based prompt-injection classifier for the Lunaris AI layer. Phase 9-γ S17 loads Meta's Prompt-Guard-86M and runs CPU inference."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"

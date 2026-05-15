@@ -1,0 +1,20 @@
+[package]
+name = "lunaris-ai-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Autonomous agent daemon for the Lunaris AI layer. Exposes org.lunaris.AIAgent1 on the session D-Bus. Each autonomous behaviour is an opt-in Settings toggle (Foundation §5.5); the daemon only runs when at least one behaviour is enabled."
+
+[[bin]]
+name = "lunaris-ai-agent"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+lunaris-ai-core = { path = "../ai-core" }
+lunaris-ai-providers = { path = "../ai-providers" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
