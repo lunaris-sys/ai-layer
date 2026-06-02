@@ -17,7 +17,8 @@
 use std::sync::Arc;
 
 use lunaris_ai_core::audit::{AuditSink, LedgerAuditSink};
-use lunaris_ai_core::graph_query::{AccessTier, QueryScope};
+use lunaris_ai_core::capability::access_tier_from_level;
+use lunaris_ai_core::graph_query::QueryScope;
 use lunaris_ai_core::graph_schema::GraphSchema;
 use lunaris_ai_core::pipeline::{CypherPipeline, GraphQuerier, QueryRunner};
 use lunaris_ai_core::provider::AIProvider;
@@ -129,27 +130,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runner: Arc<dyn QueryRunner> =
         Arc::new(CypherPipeline::new(provider, graph));
 
-    // Phase 9-α applies the Minimal scope (no graph access). The
-    // user-selectable access tier needs the per-caller capability
-    // model (S16) and the Settings tier slider (S24); until those
-    // land, `Minimal` is the honest fixed scope. The S7 enable
-    // toggle below makes the daemon switchable on/off, but the
-    // graph-read scope stays Minimal.
-    let scope = QueryScope::for_tier(
-        AccessTier::Minimal,
-        &GraphSchema::knowledge_graph(),
-    );
-
     // The audit sink submits to `lunaris-auditd` over its ingest
     // socket. It is shared: the service gates every query on a
     // dispatch entry, and the MCP discovery layer audits tool calls
     // through the same ledger.
     let audit: Arc<dyn AuditSink> = Arc::new(LedgerAuditSink::at_default_socket());
-    let service = Arc::new(AiDaemonService::new(runner, scope, audit.clone()));
 
-    // Apply ai.toml's `enabled` at startup, then keep it live: the
-    // watcher re-applies it whenever Settings rewrites the file.
-    service.set_enabled(settings.enabled);
+    // The service is constructed fail-closed: disabled, with the Minimal
+    // (no graph access) scope. The config watcher is the sole owner of
+    // the admission state (enabled flag + read scope from `ai.toml`'s
+    // `access_level`, 0..=4, Foundation §8.4); it publishes the
+    // configured admission once its file watch is armed and keeps it live
+    // on every change. Starting fail-closed means there is no window in
+    // which a stale startup snapshot serves access before the watcher is
+    // live. The Settings tier slider that writes `access_level` is S24.
+    let service = Arc::new(AiDaemonService::new(
+        runner,
+        QueryScope::for_tier(access_tier_from_level(0), &GraphSchema::knowledge_graph()),
+        audit.clone(),
+    ));
     config_watch::spawn_config_watch(service.clone());
 
     // Auto-sweep terminal records once per minute. The handle is

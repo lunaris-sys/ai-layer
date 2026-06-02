@@ -176,11 +176,13 @@ pub struct OrderSpec {
     pub descending: bool,
 }
 
-/// Foundation §8.4.6 read access tier.
+/// Foundation §8.4 read access tier.
 ///
-/// Each tier corresponds to a label set via
-/// [`QueryScope::for_tier`]. Tier selection is daemon-wide in
-/// Phase 9-α and becomes per-caller in Phase 9-γ S16.
+/// Each tier corresponds to a label set via [`QueryScope::for_tier`].
+/// Foundation models this as a single *global* AI access level (not a
+/// per-caller grant): the user picks one level in Settings. Phase 9-α
+/// pinned it to `Minimal`; S16 wires it live from `ai.toml`'s
+/// `access_level`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessTier {
     /// Tier 0: no graph access at all.
@@ -225,15 +227,23 @@ impl QueryScope {
         Self { allowed }
     }
 
-    /// Build a scope for a Foundation §8.4.6 read tier.
+    /// Build a scope for a Foundation §8.4 read tier.
     ///
-    /// Phase 9-α maps each tier to a fixed label allowlist. The
-    /// dynamic constraints Foundation attaches to tiers 1-3 (only the
-    /// current session, only the active project, only a time window)
-    /// are **not** applied here yet; that, plus making the tier
-    /// per-caller, is Phase 9-γ S16. Until then a tier is a coarse
-    /// label gate, which is still strictly better than
-    /// unconditional full access.
+    /// Each tier maps to a fixed label allowlist: a `SessionScoped`
+    /// caller cannot even name a `File` or `Project` label, a
+    /// `ProjectScoped` one cannot name a `Session`, and so on. This
+    /// coarse label gate is the enforcement S16 ships and is strictly
+    /// better than unconditional full access.
+    ///
+    /// The finer *value* constraints Foundation attaches to tiers 1-3
+    /// (only the current session's data, only the active project's
+    /// subgraph, only within a configurable lookback window) are a
+    /// follow-up: they need mandatory anchor/filter injection at Cypher
+    /// compile time (the model cannot be trusted to self-restrict) plus
+    /// a context source the daemon does not have yet — the current
+    /// session id, the Focus-Mode active project, and the lookback
+    /// setting. The same follow-up carries Focus Mode's automatic shift
+    /// to Project-scoped while a project is focused.
     pub fn for_tier(tier: AccessTier, schema: &GraphSchema) -> Self {
         match tier {
             AccessTier::Minimal => Self::new(Vec::<&str>::new()),

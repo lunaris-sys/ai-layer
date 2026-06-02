@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 pub mod audit;
+pub mod capability;
 pub mod cypher;
 pub mod graph_query;
 pub mod graph_schema;

@@ -195,22 +195,38 @@ impl Drop for InflightGuard {
     }
 }
 
+/// The daemon's admission state: whether it serves queries and the
+/// read scope it serves under, as a single unit.
+///
+/// `enabled` and `scope` live together behind one mutex so a query
+/// samples both in a single lock acquisition. Keeping them separate
+/// (an atomic bool plus a scope mutex) let a query read `enabled` in
+/// one config epoch and the scope in another across a
+/// disable-then-re-enable reload, admitting it under a scope the live
+/// config never paired with that enabled state. One atomic snapshot
+/// makes that impossible: a query sees exactly one published pair.
+#[derive(Clone)]
+struct Admission {
+    enabled: bool,
+    scope: QueryScope,
+}
+
 /// Daemon service.
 #[derive(Clone)]
 pub struct AiDaemonService {
     registry: QueryRegistry,
     runner: Arc<dyn QueryRunner>,
-    /// Capability scope applied to every query. Injected explicitly;
-    /// there is deliberately no implicit full-access default.
-    /// Phase 9-α uses a single daemon-wide scope; Phase 9-γ S16
-    /// derives it per-caller from the 5 read tiers.
-    scope: QueryScope,
+    /// Whether the daemon serves queries and under which read scope, as
+    /// one atomically-published unit. Injected explicitly (no implicit
+    /// full-access default); Settings changes the read tier (S16) and
+    /// the enabled flag live through the config watcher, which publishes
+    /// both fields together via [`AiDaemonService::set_admission`].
+    admission: Arc<Mutex<Admission>>,
     /// Audit sink. Every query commits a dispatch entry here before
     /// any provider work (the fail-closed gate) and a completion
     /// entry afterwards. Injected explicitly; the daemon binary wires
     /// the real ledger client and tests inject a mock.
     audit: Arc<dyn AuditSink>,
-    enabled: Arc<std::sync::atomic::AtomicBool>,
     inflight: Arc<Mutex<InflightTracker>>,
     max_inflight_per_caller: usize,
     max_inflight_global: usize,
@@ -250,14 +266,16 @@ impl AiDaemonService {
         Self {
             registry: QueryRegistry::new(),
             runner,
-            scope,
-            audit,
             // Fail closed: the daemon starts disabled and accepts no
             // queries until Settings explicitly enables the AI layer.
             // The AI layer is opt-in per Foundation §5.1-5.2; a
             // freshly started daemon must not serve graph reads to
             // session-bus callers on its own.
-            enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            admission: Arc::new(Mutex::new(Admission {
+                enabled: false,
+                scope,
+            })),
+            audit,
             inflight: Arc::new(Mutex::new(InflightTracker::default())),
             max_inflight_per_caller,
             max_inflight_global,
@@ -289,13 +307,38 @@ impl AiDaemonService {
     /// expose a writer for this property; only `Settings`, via the
     /// TOML config watcher (Phase 9-α S7), should change it.
     pub fn set_enabled(&self, enabled: bool) {
-        self.enabled
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        self.lock_admission().enabled = enabled;
     }
 
     /// Whether the daemon is currently accepting new queries.
     pub fn is_enabled(&self) -> bool {
-        self.enabled.load(std::sync::atomic::Ordering::SeqCst)
+        self.lock_admission().enabled
+    }
+
+    /// Replace the read-access scope, leaving the enabled flag as it is.
+    pub fn set_scope(&self, scope: QueryScope) {
+        self.lock_admission().scope = scope;
+    }
+
+    /// Publish the enabled flag and the read scope together, atomically.
+    ///
+    /// This is the setter the config watcher uses on every reload, so a
+    /// concurrent query can never observe a torn pair (one field from a
+    /// new config epoch, the other from an old one). Single-field
+    /// setters exist for startup and tests, where no query races the
+    /// update.
+    pub fn set_admission(&self, enabled: bool, scope: QueryScope) {
+        let mut adm = self.lock_admission();
+        adm.enabled = enabled;
+        adm.scope = scope;
+    }
+
+    /// Lock the admission state, recovering rather than unwrapping a
+    /// poisoned mutex so one internal panic cannot wedge the daemon.
+    fn lock_admission(&self) -> std::sync::MutexGuard<'_, Admission> {
+        self.admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Submit a query for dispatch. Returns the query handle (id +
@@ -311,13 +354,21 @@ impl AiDaemonService {
         prompt: String,
         caller: CallerIdentity,
     ) -> Result<QueryHandle, QueryError> {
-        if !self.is_enabled() {
+        // Sample the admission state once: the enabled flag and the read
+        // scope come from the same lock acquisition, so a query can
+        // never pair a stale enabled bit with a scope from a different
+        // config epoch. The scope captured here is the one the query is
+        // admitted under and is carried into dispatch, so a tier raised
+        // between admission and dispatch can never widen an
+        // already-accepted query (no TOCTOU). An empty scope (Minimal
+        // tier) is rejected up front so the pipeline never runs and no
+        // provider call is spent on a query that would always fail
+        // validation.
+        let Admission { enabled, scope } = self.lock_admission().clone();
+        if !enabled {
             return Err(QueryError::Disabled);
         }
-        // An empty scope (Minimal tier) cannot satisfy any query.
-        // Reject here so the pipeline never runs and no provider
-        // call is spent on a query that would always fail validation.
-        if self.scope.is_empty() {
+        if scope.is_empty() {
             return Err(QueryError::NoGraphAccess);
         }
         if prompt.len() > self.max_prompt_bytes {
@@ -387,7 +438,7 @@ impl AiDaemonService {
             // The guard rides along for the dispatch lifetime; when the
             // task ends it drops and releases the slot.
             let _slot = slot;
-            svc.dispatch(qid, prompt, cancel).await;
+            svc.dispatch(qid, prompt, cancel, scope).await;
         });
 
         Ok(QueryHandle {
@@ -433,11 +484,17 @@ impl AiDaemonService {
             .await
     }
 
-    async fn dispatch(&self, query_id: String, prompt: String, cancel: CancellationToken) {
+    async fn dispatch(
+        &self,
+        query_id: String,
+        prompt: String,
+        cancel: CancellationToken,
+        scope: QueryScope,
+    ) {
         self.registry.mark_in_progress(&query_id).await;
 
         let started = std::time::Instant::now();
-        let runner_call = self.runner.run_query(&prompt, &self.scope);
+        let runner_call = self.runner.run_query(&prompt, &scope);
 
         let result = tokio::select! {
             biased;
@@ -605,6 +662,83 @@ mod tests {
             CompletionOutcome::Completed { result } => assert_eq!(result, "hello"),
             other => panic!("expected completed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn set_scope_applies_live_to_admission() {
+        // A Minimal (empty) scope rejects at submission.
+        let svc = enable(AiDaemonService::new(
+            Arc::new(StubRunner {
+                reply: Ok("ok".to_string()),
+                gate: None,
+            }),
+            QueryScope::new(Vec::<&str>::new()),
+            audit_sink(),
+        ));
+        let caller = caller_id(":1.5", "/usr/bin/app-a");
+        let err = svc
+            .query("q".to_string(), caller.clone())
+            .await
+            .expect_err("minimal scope rejects");
+        assert!(matches!(err, QueryError::NoGraphAccess));
+
+        // Raising the tier live admits the next query without a restart.
+        svc.set_scope(full_scope());
+        let h = svc
+            .query("q".to_string(), caller)
+            .await
+            .expect("admitted after the tier is raised");
+        match wait_for_terminal(&svc, &h, ":1.5").await {
+            CompletionOutcome::Completed { result } => assert_eq!(result, "ok"),
+            other => panic!("expected completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_runs_under_the_admission_scope_not_a_later_change() {
+        // Records whether the scope handed to the runner was empty.
+        struct RecordingRunner {
+            gate: Arc<Notify>,
+            seen_empty: Arc<Mutex<Option<bool>>>,
+        }
+        #[async_trait]
+        impl QueryRunner for RecordingRunner {
+            async fn run_query(
+                &self,
+                _prompt: &str,
+                scope: &QueryScope,
+            ) -> Result<String, RunFailure> {
+                self.gate.notified().await;
+                *self.seen_empty.lock().unwrap() = Some(scope.is_empty());
+                Ok("ok".to_string())
+            }
+        }
+
+        let gate = Arc::new(Notify::new());
+        let seen = Arc::new(Mutex::new(None));
+        let svc = enable(AiDaemonService::new(
+            Arc::new(RecordingRunner {
+                gate: gate.clone(),
+                seen_empty: seen.clone(),
+            }),
+            full_scope(),
+            audit_sink(),
+        ));
+        let h = svc
+            .query("q".to_string(), caller_id(":1.7", "/usr/bin/app-a"))
+            .await
+            .expect("admitted under the full scope");
+        // Change the live scope to Minimal after admission but before
+        // the gated runner observes it. The query must still run under
+        // the scope it was admitted with, never a re-read snapshot.
+        svc.set_scope(QueryScope::new(Vec::<&str>::new()));
+        gate.notify_one();
+        let _ = wait_for_terminal(&svc, &h, ":1.7").await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(false),
+            "dispatch must use the non-empty admission scope, not the later Minimal one"
+        );
     }
 
     #[tokio::test]
