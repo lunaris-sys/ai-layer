@@ -182,7 +182,19 @@ impl QueryRegistry {
     /// `retrieval_token` is sent back to the caller and required on
     /// every follow-up method.
     pub async fn create(&self, submitter_unique_bus_name: String) -> CreatedQuery {
-        let query_id = uuid::Uuid::new_v4().to_string();
+        self.create_with_id(uuid::Uuid::new_v4().to_string(), submitter_unique_bus_name)
+            .await
+    }
+
+    /// Create a record with a caller-supplied `query_id`. The daemon
+    /// generates the id before the audit gate so the ledger entries
+    /// and the returned handle share one id, and only inserts the
+    /// record here once the gate has passed.
+    pub async fn create_with_id(
+        &self,
+        query_id: String,
+        submitter_unique_bus_name: String,
+    ) -> CreatedQuery {
         let mut token_bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut token_bytes);
         let retrieval_token = hex::encode(token_bytes);
@@ -220,30 +232,40 @@ impl QueryRegistry {
     /// terminal, most importantly `Cancelled`, the result is dropped
     /// and the cancellation stays final. This closes the race where
     /// a provider call resolves after a cancel has already won.
-    pub async fn mark_completed(&self, query_id: &str, result: String) {
+    ///
+    /// Returns `true` if this call made the transition, `false` if the
+    /// record was already terminal (a concurrent cancel won) or gone.
+    /// The dispatcher uses this to audit the *actual* terminal
+    /// outcome rather than the one it assumed before the race.
+    pub async fn mark_completed(&self, query_id: &str, result: String) -> bool {
         if let Some(rec) = self.inner.lock().await.get_mut(query_id) {
             if !is_in_flight(&rec.status) {
-                return;
+                return false;
             }
             rec.status = QueryStatus::Completed;
             rec.result = Some(result);
             rec.terminated_at = Some(Instant::now());
+            return true;
         }
+        false
     }
 
     /// Mark the record as failed with a stable error code. Same
-    /// terminal-status guard as [`mark_completed`].
-    pub async fn mark_failed(&self, query_id: &str, code: &str, reason: &str) {
+    /// terminal-status guard and return contract as
+    /// [`mark_completed`](Self::mark_completed).
+    pub async fn mark_failed(&self, query_id: &str, code: &str, reason: &str) -> bool {
         if let Some(rec) = self.inner.lock().await.get_mut(query_id) {
             if !is_in_flight(&rec.status) {
-                return;
+                return false;
             }
             rec.status = QueryStatus::Failed {
                 code: code.to_string(),
                 reason: reason.to_string(),
             };
             rec.terminated_at = Some(Instant::now());
+            return true;
         }
+        false
     }
 
     /// Authorised cancel. Validates caller + token, then signals

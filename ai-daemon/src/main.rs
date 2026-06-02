@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use lunaris_ai_core::audit::{AuditSink, LedgerAuditSink};
 use lunaris_ai_core::graph_query::{AccessTier, QueryScope};
 use lunaris_ai_core::graph_schema::GraphSchema;
 use lunaris_ai_core::pipeline::{CypherPipeline, GraphQuerier, QueryRunner};
@@ -138,7 +139,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         AccessTier::Minimal,
         &GraphSchema::knowledge_graph(),
     );
-    let service = Arc::new(AiDaemonService::new(runner, scope));
+
+    // The audit sink submits to `lunaris-auditd` over its ingest
+    // socket. It is shared: the service gates every query on a
+    // dispatch entry, and the MCP discovery layer audits tool calls
+    // through the same ledger.
+    let audit: Arc<dyn AuditSink> = Arc::new(LedgerAuditSink::at_default_socket());
+    let service = Arc::new(AiDaemonService::new(runner, scope, audit.clone()));
 
     // Apply ai.toml's `enabled` at startup, then keep it live: the
     // watcher re-applies it whenever Settings rewrites the file.
@@ -173,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // namespace. `run` subscribes (retrying if the bus is late),
     // reconciles against the sockets already on disk, and tracks
     // installs and removals for the rest of the session.
-    let discovery = Arc::new(McpDiscovery::new());
+    let discovery = Arc::new(McpDiscovery::new(audit.clone()));
     let consumer = UnixEventConsumer::new(resolve_event_consumer_socket());
     tokio::spawn(discovery.run(consumer));
 
@@ -227,6 +234,9 @@ impl AiInterface {
             )),
             Err(QueryError::NoGraphAccess) => Err(zbus::fdo::Error::NotSupported(
                 "ai layer has no graph access configured".to_string(),
+            )),
+            Err(QueryError::AuditUnavailable) => Err(zbus::fdo::Error::Failed(
+                "audit log unavailable; query refused".to_string(),
             )),
         }
     }

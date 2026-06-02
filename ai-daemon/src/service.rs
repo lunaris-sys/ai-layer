@@ -16,12 +16,12 @@
 //! provider calls transit `ai-proxy` (Foundation §8.4.6).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use lunaris_ai_core::audit::{self, AuditSink};
 use lunaris_ai_core::graph_query::QueryScope;
 use lunaris_ai_core::pipeline::QueryRunner;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::registry::{AuthError, CompletionOutcome, CreatedQuery, QueryRegistry, QueryStatus};
@@ -81,6 +81,11 @@ pub enum QueryError {
     /// call so an impossible query never burns an LLM round-trip.
     #[error("ai layer has no graph access configured")]
     NoGraphAccess,
+    /// The audit log could not record the query's dispatch entry.
+    /// Foundation §8.4.6 admits no un-audited AI activity, so the
+    /// query is refused rather than run unrecorded.
+    #[error("audit log unavailable")]
+    AuditUnavailable,
 }
 
 impl QueryError {
@@ -92,6 +97,7 @@ impl QueryError {
             QueryError::GlobalCapacityReached => "global-capacity-reached",
             QueryError::PromptTooLarge(_) => "prompt-too-large",
             QueryError::NoGraphAccess => "no-graph-access",
+            QueryError::AuditUnavailable => "audit-unavailable",
         }
     }
 }
@@ -156,6 +162,39 @@ impl InflightTracker {
     }
 }
 
+/// RAII release for one acquired in-flight slot.
+///
+/// Built the instant a slot is acquired and held across the audit
+/// gate and registry creation, then moved into the spawned dispatch
+/// task. Because the slot's lifetime *is* the guard's lifetime, the
+/// slot is returned on every exit path — a normal dispatch
+/// completion, the audit-failure early return, and — the case a
+/// manual `release` call misses — a `query()` future that is dropped
+/// or cancelled while awaiting `auditd` or the registry lock.
+///
+/// The tracker uses a `std::sync::Mutex`, not a tokio one, precisely
+/// so this `Drop` (a synchronous context) can return the slot. The
+/// lock is held only for the brief release and never across an
+/// `.await`, so a blocking mutex is correct here.
+struct InflightGuard {
+    inflight: Arc<Mutex<InflightTracker>>,
+    stable_id: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        // Recover the tracker even if the lock was poisoned by a panic
+        // elsewhere: a poisoned lock must still return the slot, never
+        // leak it. The tracker holds only counters, so reading through
+        // a poison is safe.
+        let mut tracker = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tracker.release(&self.stable_id);
+    }
+}
+
 /// Daemon service.
 #[derive(Clone)]
 pub struct AiDaemonService {
@@ -166,6 +205,11 @@ pub struct AiDaemonService {
     /// Phase 9-α uses a single daemon-wide scope; Phase 9-γ S16
     /// derives it per-caller from the 5 read tiers.
     scope: QueryScope,
+    /// Audit sink. Every query commits a dispatch entry here before
+    /// any provider work (the fail-closed gate) and a completion
+    /// entry afterwards. Injected explicitly; the daemon binary wires
+    /// the real ledger client and tests inject a mock.
+    audit: Arc<dyn AuditSink>,
     enabled: Arc<std::sync::atomic::AtomicBool>,
     inflight: Arc<Mutex<InflightTracker>>,
     max_inflight_per_caller: usize,
@@ -175,12 +219,18 @@ pub struct AiDaemonService {
 
 impl AiDaemonService {
     /// Build a service over a query runner with the default limits.
-    /// The capability `scope` is supplied by the caller; there is no
-    /// implicit full-access default.
-    pub fn new(runner: Arc<dyn QueryRunner>, scope: QueryScope) -> Self {
+    /// The capability `scope` and the `audit` sink are supplied by the
+    /// caller; there is no implicit full-access default and no
+    /// implicit auditing default.
+    pub fn new(
+        runner: Arc<dyn QueryRunner>,
+        scope: QueryScope,
+        audit: Arc<dyn AuditSink>,
+    ) -> Self {
         Self::with_limits(
             runner,
             scope,
+            audit,
             DEFAULT_MAX_INFLIGHT_PER_CALLER,
             DEFAULT_MAX_INFLIGHT_GLOBAL,
             DEFAULT_MAX_PROMPT_BYTES,
@@ -192,6 +242,7 @@ impl AiDaemonService {
     pub fn with_limits(
         runner: Arc<dyn QueryRunner>,
         scope: QueryScope,
+        audit: Arc<dyn AuditSink>,
         max_inflight_per_caller: usize,
         max_inflight_global: usize,
         max_prompt_bytes: usize,
@@ -200,6 +251,7 @@ impl AiDaemonService {
             registry: QueryRegistry::new(),
             runner,
             scope,
+            audit,
             // Fail closed: the daemon starts disabled and accepts no
             // queries until Settings explicitly enables the AI layer.
             // The AI layer is opt-in per Foundation §5.1-5.2; a
@@ -271,30 +323,71 @@ impl AiDaemonService {
         if prompt.len() > self.max_prompt_bytes {
             return Err(QueryError::PromptTooLarge(prompt.len()));
         }
-        match self.inflight.lock().await.try_acquire(
-            &caller.stable_id,
-            self.max_inflight_per_caller,
-            self.max_inflight_global,
-        ) {
+        // Acquire a slot under the (blocking) lock, then immediately
+        // wrap it in an RAII guard so the slot is returned on every
+        // exit path below — including this `query()` future being
+        // dropped or cancelled while it awaits the audit gate or the
+        // registry. The lock is released before the first `.await`. A
+        // poisoned lock is recovered rather than unwrapped, so one
+        // internal panic cannot wedge all future submissions.
+        let acquired = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .try_acquire(
+                &caller.stable_id,
+                self.max_inflight_per_caller,
+                self.max_inflight_global,
+            );
+        match acquired {
             AcquireResult::Acquired => {}
             AcquireResult::CallerFull => return Err(QueryError::TooManyInflight),
             AcquireResult::GlobalFull => return Err(QueryError::GlobalCapacityReached),
         }
+        let slot = InflightGuard {
+            inflight: Arc::clone(&self.inflight),
+            stable_id: caller.stable_id.clone(),
+        };
+
+        // Generate the query id up front so the dispatch and
+        // completion ledger entries carry the same id the caller uses
+        // for status, cancellation, and support — the ledger joins
+        // back to the handle. The registry record is created only
+        // after the gate passes, so a refused query leaves nothing
+        // behind to clean up.
+        let query_id = uuid::Uuid::new_v4().to_string();
+
+        // Audit-before-action gate (foundation §8.4.6). The dispatch
+        // entry is committed before any provider work; if the audit
+        // log cannot record it, the query is refused — un-audited AI
+        // activity is not permitted. On this early return `slot` drops
+        // and releases the in-flight slot, so a refused query does not
+        // leak quota.
+        if let Err(err) = self
+            .audit
+            .submit(audit::query_event("dispatched", None, &query_id))
+            .await
+        {
+            tracing::warn!("query refused: audit log unavailable: {err}");
+            return Err(QueryError::AuditUnavailable);
+        }
+
         let CreatedQuery {
             query_id,
             retrieval_token,
             cancel,
         } = self
             .registry
-            .create(caller.unique_bus_name.clone())
+            .create_with_id(query_id, caller.unique_bus_name.clone())
             .await;
 
         let svc = self.clone();
         let qid = query_id.clone();
-        let stable_id = caller.stable_id.clone();
         tokio::spawn(async move {
+            // The guard rides along for the dispatch lifetime; when the
+            // task ends it drops and releases the slot.
+            let _slot = slot;
             svc.dispatch(qid, prompt, cancel).await;
-            svc.inflight.lock().await.release(&stable_id);
         });
 
         Ok(QueryHandle {
@@ -343,27 +436,71 @@ impl AiDaemonService {
     async fn dispatch(&self, query_id: String, prompt: String, cancel: CancellationToken) {
         self.registry.mark_in_progress(&query_id).await;
 
+        let started = std::time::Instant::now();
         let runner_call = self.runner.run_query(&prompt, &self.scope);
 
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                // Cancellation already updates status in the registry
-                // via `cancel()`. Nothing further to do.
+                // Cancelled while the runner was still going. `cancel()`
+                // already set the registry to Cancelled; record the
+                // terminal entry so the ledger shows the query did not
+                // run to completion, then abandon the runner.
+                self.audit_completion(&query_id, "cancelled", started.elapsed())
+                    .await;
                 return;
             }
             res = runner_call => res,
         };
 
-        match result {
+        // The runner finished. Claim the terminal state in the
+        // registry FIRST; `mark_*` returns whether this call won the
+        // transition. A cancel landing in the window between the
+        // runner returning and this claim makes `mark_*` a no-op, and
+        // the audit entry must then say "cancelled", not "completed" —
+        // the ledger must agree with the user-visible outcome.
+        let outcome = match result {
             Ok(answer) => {
-                self.registry.mark_completed(&query_id, answer).await;
+                if self.registry.mark_completed(&query_id, answer).await {
+                    "completed"
+                } else {
+                    "cancelled"
+                }
             }
             Err(failure) => {
-                self.registry
+                if self
+                    .registry
                     .mark_failed(&query_id, &failure.code, &failure.reason)
-                    .await;
+                    .await
+                {
+                    "failed"
+                } else {
+                    "cancelled"
+                }
             }
+        };
+        self.audit_completion(&query_id, outcome, started.elapsed())
+            .await;
+    }
+
+    /// Submit the completion audit entry for a query.
+    ///
+    /// Best-effort: the query has already run (or been cancelled) and
+    /// the dispatch entry already satisfied foundation §8.4.6, so a
+    /// sink failure here is logged rather than propagated. The entry
+    /// carries the measured `duration` and reuses the `query_id` as
+    /// the call-chain id, so it joins to the dispatch entry and to the
+    /// caller's handle.
+    async fn audit_completion(
+        &self,
+        query_id: &str,
+        outcome: &str,
+        duration: std::time::Duration,
+    ) {
+        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let event = audit::query_event(outcome, Some(duration_ms), query_id);
+        if let Err(err) = self.audit.submit(event).await {
+            tracing::warn!("query completion audit failed: {err}");
         }
     }
 }
@@ -438,6 +575,13 @@ mod tests {
         )
     }
 
+    /// An accepting audit sink for tests that exercise the query
+    /// path. The audit-unavailable path uses a `failing()` sink
+    /// explicitly.
+    fn audit_sink() -> Arc<dyn AuditSink> {
+        Arc::new(audit_proto::MockAuditSink::accepting())
+    }
+
     /// Enable a freshly built service. The daemon is fail-closed by
     /// default; tests that exercise the query path flip it on
     /// explicitly, just as Settings does in production.
@@ -451,7 +595,7 @@ mod tests {
         let svc = enable(AiDaemonService::new(Arc::new(StubRunner {
             reply: Ok("hello".to_string()),
             gate: None,
-        }), full_scope()));
+        }), full_scope(), audit_sink()));
         let h = svc
             .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
             .await
@@ -468,7 +612,7 @@ mod tests {
         let svc = enable(AiDaemonService::new(Arc::new(StubRunner {
             reply: Ok("secret".to_string()),
             gate: None,
-        }), full_scope()));
+        }), full_scope(), audit_sink()));
         let h = svc
             .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
             .await
@@ -488,7 +632,7 @@ mod tests {
         let svc = enable(AiDaemonService::new(Arc::new(StubRunner {
             reply: Ok("secret".to_string()),
             gate: None,
-        }), full_scope()));
+        }), full_scope(), audit_sink()));
         let h = svc
             .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
             .await
@@ -506,7 +650,7 @@ mod tests {
         let svc = enable(AiDaemonService::new(Arc::new(StubRunner {
             reply: Ok("never".to_string()),
             gate: Some(gate.clone()),
-        }), full_scope()));
+        }), full_scope(), audit_sink()));
         let h = svc
             .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
             .await
@@ -543,6 +687,7 @@ mod tests {
                 gate: None,
             }),
             minimal,
+            audit_sink(),
         ));
         let err = svc
             .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
@@ -559,7 +704,7 @@ mod tests {
             reply: Ok("never".to_string()),
             gate: None,
         });
-        let svc = AiDaemonService::new(runner, full_scope());
+        let svc = AiDaemonService::new(runner, full_scope(), audit_sink());
         // No enable() call: the default must be disabled.
         let err = svc
             .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
@@ -573,7 +718,7 @@ mod tests {
         let svc = enable(AiDaemonService::new(Arc::new(StubRunner {
             reply: Ok("never".to_string()),
             gate: None,
-        }), full_scope()));
+        }), full_scope(), audit_sink()));
         svc.set_enabled(false);
         let err = svc
             .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
@@ -590,6 +735,7 @@ mod tests {
                 gate: None,
             }),
             full_scope(),
+            audit_sink(),
             4,
             DEFAULT_MAX_INFLIGHT_GLOBAL,
             16,
@@ -617,6 +763,7 @@ mod tests {
                 gate: Some(gate.clone()),
             }),
             full_scope(),
+            audit_sink(),
             2,
             DEFAULT_MAX_INFLIGHT_GLOBAL,
             DEFAULT_MAX_PROMPT_BYTES,
@@ -644,7 +791,7 @@ mod tests {
             if svc
                 .inflight
                 .lock()
-                .await
+                .unwrap()
                 .by_stable_id
                 .get(stable)
                 .copied()
@@ -672,6 +819,7 @@ mod tests {
                 gate: Some(gate.clone()),
             }),
             full_scope(),
+            audit_sink(),
             4,
             2, // tiny global cap
             DEFAULT_MAX_PROMPT_BYTES,
@@ -704,7 +852,7 @@ mod tests {
                 reason: "knowledge graph unreachable".to_string(),
             }),
             gate: None,
-        }), full_scope()));
+        }), full_scope(), audit_sink()));
         let h = svc
             .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
             .await
@@ -714,5 +862,188 @@ mod tests {
             CompletionOutcome::Failed { code, .. } => assert_eq!(code, "graph-error"),
             other => panic!("expected failed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn query_is_refused_when_the_audit_log_is_unavailable() {
+        // Foundation §8.4.6: no un-audited AI activity. A failing
+        // audit sink must make the query fail closed, and the
+        // in-flight slot it briefly held must be released so the
+        // refusal does not leak quota.
+        let svc = enable(AiDaemonService::new(
+            Arc::new(StubRunner {
+                reply: Ok("never reached".to_string()),
+                gate: None,
+            }),
+            full_scope(),
+            Arc::new(audit_proto::MockAuditSink::failing()),
+        ));
+        let err = svc
+            .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
+            .await
+            .expect_err("audit-unavailable refuses the query");
+        assert_eq!(err.code(), "audit-unavailable");
+        // The slot was released: the per-caller in-flight count for
+        // this stable id is back to zero.
+        assert_eq!(
+            svc.inflight
+                .lock()
+                .unwrap()
+                .by_stable_id
+                .get("/usr/bin/app-a")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn happy_path_writes_dispatch_and_completion_audit_entries() {
+        // A completed query commits two linked ledger entries: a
+        // dispatch entry (the gate) and a completion entry with the
+        // measured duration. Both share one call-chain id.
+        let sink = Arc::new(audit_proto::MockAuditSink::accepting());
+        let svc = enable(AiDaemonService::new(
+            Arc::new(StubRunner {
+                reply: Ok("hello".to_string()),
+                gate: None,
+            }),
+            full_scope(),
+            sink.clone(),
+        ));
+        let h = svc
+            .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
+            .await
+            .unwrap();
+        let _ = wait_for_terminal(&svc, &h, ":1.42").await;
+        let recorded = sink.recorded().await;
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].structural.outcome, "dispatched");
+        assert_eq!(recorded[0].structural.duration_ms, None);
+        assert_eq!(recorded[1].structural.outcome, "completed");
+        assert!(recorded[1].structural.duration_ms.is_some());
+        assert_eq!(recorded[0].call_chain_id, recorded[1].call_chain_id);
+        // The ledger entries carry the same id the caller holds, so
+        // an entry joins back to the query handle for investigation.
+        assert_eq!(recorded[0].call_chain_id.as_deref(), Some(h.query_id.as_str()));
+    }
+
+    /// Audit sink whose `submit` parks on a notify until released, so
+    /// a test can hold a `query()` future inside the audit gate.
+    struct GatedAuditSink {
+        gate: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl AuditSink for GatedAuditSink {
+        async fn submit(
+            &self,
+            _event: lunaris_ai_core::audit::IngestRequest,
+        ) -> Result<u64, lunaris_ai_core::audit::AuditClientError> {
+            self.gate.notified().await;
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn inflight_slot_released_when_query_future_dropped_mid_audit() {
+        // The audit gate parks; the `query()` future is then dropped
+        // while waiting on it. The RAII in-flight guard must return
+        // the slot so a cancelled submission does not leak quota.
+        let gate = Arc::new(Notify::new());
+        let svc = enable(AiDaemonService::new(
+            Arc::new(StubRunner {
+                reply: Ok("x".to_string()),
+                gate: None,
+            }),
+            full_scope(),
+            Arc::new(GatedAuditSink { gate: gate.clone() }),
+        ));
+        let svc2 = svc.clone();
+        let handle = tokio::spawn(async move {
+            svc2.query("hi".to_string(), caller_id(":1.1", "/usr/bin/app-a"))
+                .await
+        });
+        // Wait until the slot is acquired and the future is parked in
+        // the gated audit submit.
+        let mut acquired = false;
+        for _ in 0..200 {
+            if svc.inflight.lock().unwrap().global == 1 {
+                acquired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(acquired, "slot should be acquired while audit is parked");
+
+        // Drop the query future mid-audit.
+        handle.abort();
+
+        // The guard must release the slot.
+        let mut released = false;
+        for _ in 0..200 {
+            if svc.inflight.lock().unwrap().global == 0 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(released, "dropped query future must release its in-flight slot");
+    }
+
+    #[tokio::test]
+    async fn cancel_during_runner_audits_cancelled_not_completed() {
+        // A cancel arriving while the runner is in flight must make
+        // the ledger record "cancelled", never "completed". The
+        // dispatch entry is still present; no completion entry lies.
+        let gate = Arc::new(Notify::new());
+        let sink = Arc::new(audit_proto::MockAuditSink::accepting());
+        let svc = enable(AiDaemonService::new(
+            Arc::new(StubRunner {
+                reply: Ok("never returned".to_string()),
+                gate: Some(gate.clone()),
+            }),
+            full_scope(),
+            sink.clone(),
+        ));
+        let h = svc
+            .query("hi".to_string(), caller_id(":1.42", "/usr/bin/app-a"))
+            .await
+            .unwrap();
+        // The dispatch task is parked in the gated runner. Cancelling
+        // fires the cancellation token, so the dispatch select takes
+        // its cancel branch.
+        assert!(svc
+            .cancel(&h.query_id, ":1.42", &h.retrieval_token)
+            .await
+            .unwrap());
+
+        // Wait for the dispatch task to record the terminal entry.
+        let mut saw_cancelled = false;
+        for _ in 0..200 {
+            if sink
+                .recorded()
+                .await
+                .iter()
+                .any(|e| e.structural.outcome == "cancelled")
+            {
+                saw_cancelled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(saw_cancelled, "a cancelled query must be audited as cancelled");
+        let recorded = sink.recorded().await;
+        assert!(
+            recorded.iter().any(|e| e.structural.outcome == "dispatched"),
+            "the dispatch entry must still be present"
+        );
+        assert!(
+            !recorded.iter().any(|e| e.structural.outcome == "completed"),
+            "a cancelled query must not be audited as completed"
+        );
+
+        // Release the gate so the abandoned runner future unwinds.
+        gate.notify_one();
     }
 }

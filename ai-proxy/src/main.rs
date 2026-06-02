@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use lunaris_ai_proxy::allowlist::Allowlist;
-use lunaris_ai_proxy::audit::{AuditSink, TracingAuditSink};
+use lunaris_ai_proxy::audit::{AuditSink, LedgerAuditSink};
 use lunaris_ai_proxy::catalog::ProviderCatalog;
 use lunaris_ai_proxy::forward::ReqwestForwarder;
 use lunaris_ai_proxy::peer_auth::{self, PeerAuthError, PeerAuthMap};
@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let forwarder = Arc::new(ReqwestForwarder::new()?);
-    let audit_sink: Arc<dyn AuditSink> = Arc::new(TracingAuditSink);
+    let audit_sink: Arc<dyn AuditSink> = Arc::new(LedgerAuditSink::at_default_socket());
     let service = Arc::new(ProxyService::new(
         Allowlist::default_lunaris(),
         ProviderCatalog::default_lunaris(),

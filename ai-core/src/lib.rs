@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod audit;
 pub mod cypher;
 pub mod graph_query;
 pub mod graph_schema;

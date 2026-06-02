@@ -52,6 +52,11 @@ pub enum ProxyError {
     /// concurrent upstream calls.
     #[error("proxy at concurrency capacity")]
     AtCapacity,
+    /// The pre-forward audit entry could not be committed, so the
+    /// outbound call was refused before the request left the host.
+    /// Foundation §8.4.6: no un-audited AI network activity.
+    #[error("audit log unavailable")]
+    AuditUnavailable,
     /// Upstream call failed transport-side.
     #[error("upstream: {0}")]
     Upstream(#[from] ForwardError),
@@ -69,6 +74,7 @@ impl ProxyError {
             ProxyError::Allowlist(RejectReason::DisallowedScheme { .. }) => "disallowed-scheme",
             ProxyError::Allowlist(RejectReason::HostNotAllowed { .. }) => "host-not-allowed",
             ProxyError::AtCapacity => "proxy-at-capacity",
+            ProxyError::AuditUnavailable => "audit-unavailable",
             ProxyError::Upstream(_) => "upstream-error",
         }
     }
@@ -243,7 +249,7 @@ impl ProxyService {
             let err = ProxyError::CallerNotAllowed {
                 caller: caller.label().to_string(),
             };
-            self.audit_record(
+            self.audit_best_effort(
                 &req,
                 None,
                 AuditOutcome::RejectedByPolicy {
@@ -261,7 +267,7 @@ impl ProxyService {
                 let err = ProxyError::UnknownProvider {
                     provider: req.provider_name.clone(),
                 };
-                self.audit_record(
+                self.audit_best_effort(
                     &req,
                     None,
                     AuditOutcome::RejectedByPolicy {
@@ -279,7 +285,7 @@ impl ProxyService {
             AllowlistDecision::Allowed { host } => host,
             AllowlistDecision::Rejected(reason) => {
                 let err = ProxyError::Allowlist(reason);
-                self.audit_record(
+                self.audit_best_effort(
                     &req,
                     None,
                     AuditOutcome::RejectedByPolicy {
@@ -302,7 +308,7 @@ impl ProxyService {
         let _slot = InflightGuard(self.inflight.clone());
         if prev >= self.max_inflight {
             let err = ProxyError::AtCapacity;
-            self.audit_record(
+            self.audit_best_effort(
                 &req,
                 Some(&host),
                 AuditOutcome::RejectedByPolicy {
@@ -313,10 +319,19 @@ impl ProxyService {
             return Err(err);
         }
 
-        // 5. Forward.
+        // 5. Audit-before-action gate (foundation §8.4.6). The proxy
+        //    is the network egress chokepoint, so it must record the
+        //    outbound call *before* it leaves the host and refuse the
+        //    call if the ledger cannot record it. On this early return
+        //    `_slot` drops and releases the concurrency slot.
+        self.audit_forwarding_gate(&req, &host).await?;
+
+        // 6. Forward. The status entry is best-effort: the call has
+        //    already happened, so a ledger hiccup here does not undo
+        //    it; the pre-forward entry already satisfies §8.4.6.
         match self.forwarder.post(&endpoint_url, &req.body_json).await {
             Ok(result) => {
-                self.audit_record(
+                self.audit_best_effort(
                     &req,
                     Some(&host),
                     AuditOutcome::Forwarded {
@@ -331,7 +346,7 @@ impl ProxyService {
             }
             Err(err) => {
                 let detail = err.to_string();
-                self.audit_record(
+                self.audit_best_effort(
                     &req,
                     Some(&host),
                     AuditOutcome::UpstreamError { detail },
@@ -342,20 +357,51 @@ impl ProxyService {
         }
     }
 
-    async fn audit_record(
+    /// Commit the fail-closed pre-forward entry. Returns
+    /// `Err(ProxyError::AuditUnavailable)` if the ledger cannot record
+    /// it, so the caller refuses the forward rather than letting an
+    /// unaudited request leave the host.
+    async fn audit_forwarding_gate(
+        &self,
+        req: &ForwardRequest,
+        host: &str,
+    ) -> Result<(), ProxyError> {
+        let record = AuditRecord {
+            audit_token: req.audit_token.clone(),
+            provider_name: req.provider_name.clone(),
+            host: Some(host.to_string()),
+            outcome: AuditOutcome::Forwarding,
+        };
+        self.audit_sink
+            .submit(record.to_ingest_request())
+            .await
+            .map(|_| ())
+            .map_err(|err| {
+                tracing::warn!(
+                    "ai-proxy forward refused: audit log unavailable: {err}"
+                );
+                ProxyError::AuditUnavailable
+            })
+    }
+
+    /// Record one audit entry best-effort: a ledger failure is logged,
+    /// not propagated. Used for rejections (nothing left the host) and
+    /// for the post-forward status entry (the call already happened).
+    async fn audit_best_effort(
         &self,
         req: &ForwardRequest,
         host: Option<&str>,
         outcome: AuditOutcome,
     ) {
-        self.audit_sink
-            .record(AuditRecord {
-                audit_token: req.audit_token.clone(),
-                provider_name: req.provider_name.clone(),
-                host: host.map(str::to_string),
-                outcome,
-            })
-            .await;
+        let record = AuditRecord {
+            audit_token: req.audit_token.clone(),
+            provider_name: req.provider_name.clone(),
+            host: host.map(str::to_string),
+            outcome,
+        };
+        if let Err(err) = self.audit_sink.submit(record.to_ingest_request()).await {
+            tracing::warn!("ai-proxy audit submit failed: {err}");
+        }
     }
 }
 
@@ -416,11 +462,12 @@ mod tests {
         assert_eq!(calls[0].0, "http://localhost:11434/v1/chat/completions");
 
         let records = sink.snapshot().await;
-        assert!(matches!(
-            records[0].outcome,
-            AuditOutcome::Forwarded { upstream_status: 200 }
-        ));
-        assert_eq!(records[0].host.as_deref(), Some("localhost"));
+        // Two entries: the fail-closed pre-forward gate, then the
+        // best-effort status entry.
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].structural.outcome, "forwarding");
+        assert_eq!(records[0].structural.subject, "localhost");
+        assert_eq!(records[1].structural.outcome, "forwarded-200");
     }
 
     #[tokio::test]
@@ -515,11 +562,11 @@ mod tests {
             .expect_err("fail");
         assert_eq!(err.code(), "upstream-error");
         let records = sink.snapshot().await;
-        assert!(matches!(
-            records[0].outcome,
-            AuditOutcome::UpstreamError { .. }
-        ));
-        assert_eq!(records[0].host.as_deref(), Some("localhost"));
+        // Pre-forward gate entry, then the best-effort error entry.
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].structural.outcome, "forwarding");
+        assert_eq!(records[1].structural.outcome, "upstream-error");
+        assert_eq!(records[1].structural.subject, "localhost");
     }
 
     #[tokio::test]
@@ -614,5 +661,38 @@ mod tests {
         )
         .await
         .expect("forward admitted after slot freed");
+    }
+
+    #[tokio::test]
+    async fn forward_is_refused_when_audit_is_unavailable() {
+        // The audit ledger is down. The proxy must refuse the forward
+        // before any request leaves the host (foundation §8.4.6),
+        // even though the caller, provider, and allowlist all pass.
+        let forwarder = Arc::new(StubForwarder::new(vec![Ok(ForwardResult {
+            status: 200,
+            body: "{}".to_string(),
+        })]));
+        let sink = Arc::new(CollectingAuditSink::failing());
+        let svc = ProxyService::new(
+            Allowlist::default_lunaris(),
+            ProviderCatalog::default_lunaris(),
+            CallerAllowlist::default_lunaris(),
+            forwarder.clone() as Arc<dyn Forwarder>,
+            sink as Arc<dyn AuditSink>,
+        );
+        let err = svc
+            .forward(
+                &ai_daemon_caller(),
+                ForwardRequest {
+                    provider_name: "ollama-default".to_string(),
+                    body_json: "{}".to_string(),
+                    audit_token: "tok".to_string(),
+                },
+            )
+            .await
+            .expect_err("audit-unavailable must refuse the forward");
+        assert_eq!(err.code(), "audit-unavailable");
+        // The request never left the host: the forwarder was not called.
+        assert!(forwarder.calls.lock().await.is_empty());
     }
 }

@@ -22,6 +22,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use lunaris_ai_core::audit::AuditSink;
 use lunaris_ai_core::mcp::{McpClient, ServerClass, ServerId};
 use lunaris_permissions::identity::app_id_from_pid;
 use os_sdk::event_consumer::{EventConsumer, UnixEventConsumer};
@@ -57,9 +58,13 @@ pub struct McpDiscovery {
 
 impl McpDiscovery {
     /// Build a discovery handle around a fresh, empty client.
-    pub fn new() -> Self {
+    ///
+    /// `audit` is wired into that client so every tool call dispatched
+    /// through a discovered module server commits a content-free
+    /// audit-ledger entry.
+    pub fn new(audit: Arc<dyn AuditSink>) -> Self {
         Self {
-            client: Arc::new(Mutex::new(McpClient::new())),
+            client: Arc::new(Mutex::new(McpClient::new().with_audit(audit))),
         }
     }
 
@@ -230,12 +235,6 @@ impl McpDiscovery {
             .await
             .disconnect(&ServerId(module_id.to_string()));
         info!(module = module_id, "mcp discovery: disconnected");
-    }
-}
-
-impl Default for McpDiscovery {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

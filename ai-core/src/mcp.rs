@@ -21,12 +21,15 @@
 //!   confirmation prompt regardless of any standing authorization.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::ServiceExt;
 use tokio::net::UnixStream;
 use uuid::Uuid;
+
+use crate::audit::AuditSink;
 
 /// Default maximum MCP call-chain depth. Legitimate nested calls
 /// rarely exceed two or three levels; five is a conservative cap.
@@ -113,6 +116,11 @@ pub enum McpError {
     /// The server reported the tool call itself as an error.
     #[error("mcp tool reported an error: {0}")]
     ToolError(String),
+    /// The pre-dispatch audit entry could not be committed, so the
+    /// tool call was refused before reaching the server. Foundation
+    /// §8.4.6 admits no un-audited AI action.
+    #[error("mcp call refused: audit log unavailable: {0}")]
+    AuditUnavailable(String),
 }
 
 /// Permission class of an MCP server.
@@ -151,10 +159,10 @@ pub struct McpConnection {
     class: ServerClass,
 }
 
-/// One audit record for an MCP call. The full audit ledger with
-/// hash-chain integrity is Phase 9-γ; until then records are emitted
-/// as structured `tracing` events, the same policy-only stub the
-/// rest of the AI layer's auditing uses.
+/// One audit record for an MCP call. Always emitted as a structured
+/// `tracing` event; in addition, when the client carries an
+/// [`AuditSink`], a content-free entry is committed to the audit
+/// ledger via [`crate::audit::mcp_event`].
 #[derive(Debug, Clone)]
 pub struct McpAuditRecord {
     /// Identifier shared by every call in the chain.
@@ -193,6 +201,10 @@ impl McpAuditRecord {
 pub struct McpClient {
     servers: HashMap<ServerId, McpConnection>,
     max_depth: u8,
+    /// Audit sink for tool-call entries. `None` until a sink is wired
+    /// with [`with_audit`](McpClient::with_audit); calls are still
+    /// `tracing`-logged either way.
+    audit: Option<Arc<dyn AuditSink>>,
 }
 
 impl Default for McpClient {
@@ -207,6 +219,7 @@ impl McpClient {
         Self {
             servers: HashMap::new(),
             max_depth: DEFAULT_MAX_DEPTH,
+            audit: None,
         }
     }
 
@@ -216,7 +229,16 @@ impl McpClient {
         Self {
             servers: HashMap::new(),
             max_depth: max_depth.clamp(1, MAX_DEPTH_CEILING),
+            audit: None,
         }
+    }
+
+    /// Attach an audit sink. Every subsequent tool call commits a
+    /// content-free entry to the ledger in addition to the `tracing`
+    /// log.
+    pub fn with_audit(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.audit = Some(sink);
+        self
     }
 
     /// The effective call-chain depth limit.
@@ -344,20 +366,13 @@ impl McpClient {
         arguments: serde_json::Value,
         chain: &CallChain,
     ) -> Result<String, McpError> {
-        // Helper to emit one audit record for this call.
-        let audit = |outcome: &'static str| {
-            McpAuditRecord {
-                call_chain_id: chain.id,
-                depth: chain.depth,
-                server: id.0.clone(),
-                tool: tool.to_string(),
-                outcome,
-            }
-            .emit();
-        };
-
+        // The pre-dispatch checks below are rejections: nothing
+        // reaches the server, so no AI *action* happens and their
+        // audit is best-effort post-hoc.
         if chain.depth > self.max_depth {
-            audit("depth-exceeded");
+            // Refused before the server is even looked up: the target
+            // is unresolved, so its identifiers are not trusted.
+            self.audit_outcome(id, tool, chain, "depth-exceeded", false).await;
             return Err(McpError::DepthExceeded {
                 depth: chain.depth,
                 max: self.max_depth,
@@ -366,10 +381,14 @@ impl McpClient {
         let conn = match self.servers.get(id) {
             Some(conn) => conn,
             None => {
-                audit("unknown-server");
+                // Unknown server: the id is an arbitrary caller string,
+                // unresolved and untrusted.
+                self.audit_outcome(id, tool, chain, "unknown-server", false).await;
                 return Err(McpError::UnknownServer(id.0.clone()));
             }
         };
+        // From here the server is connected — a discovery-attested,
+        // path-safe module id — so its identifier is trusted.
 
         let arguments = match arguments {
             serde_json::Value::Object(map) => Some(map),
@@ -378,12 +397,19 @@ impl McpClient {
                 // A non-object, non-null argument is not a valid MCP
                 // argument set; surface it rather than silently
                 // dropping the call.
-                audit("bad-arguments");
+                self.audit_outcome(id, tool, chain, "bad-arguments", true).await;
                 return Err(McpError::CallFailed(format!(
                     "tool arguments must be a JSON object, got {other}"
                 )));
             }
         };
+
+        // Audit-before-action gate (foundation §8.4.6). A tool call on
+        // an action server mutates state; it must be recorded before
+        // it runs. The dispatch entry is committed first and, if the
+        // ledger cannot record it, the call is refused — never run
+        // unaudited. Best-effort `tracing` always fires.
+        self.audit_dispatch(id, tool, chain).await?;
 
         let mut params = CallToolRequestParams::new(tool.to_string());
         if let Some(map) = arguments {
@@ -392,18 +418,105 @@ impl McpClient {
         let result = match conn.service.call_tool(params).await {
             Ok(result) => result,
             Err(err) => {
-                audit("failed");
+                self.audit_outcome(id, tool, chain, "failed", true).await;
                 return Err(McpError::CallFailed(err.to_string()));
             }
         };
 
         let text = flatten_content(&result.content);
         if result.is_error.unwrap_or(false) {
-            audit("tool-error");
+            self.audit_outcome(id, tool, chain, "tool-error", true).await;
             return Err(McpError::ToolError(text));
         }
-        audit("ok");
+        self.audit_outcome(id, tool, chain, "ok", true).await;
         Ok(text)
+    }
+
+    /// Commit the fail-closed pre-dispatch tool-call entry.
+    ///
+    /// A tool call is an AI action and must be recorded before it
+    /// runs. This is fail-closed in both directions: if a wired sink
+    /// cannot record the entry, *and* if no sink is wired at all, the
+    /// call is refused with [`McpError::AuditUnavailable`] rather than
+    /// dispatched unaudited. The invariant is thus a property of this
+    /// method, not of a wiring convention — production wires a sink
+    /// through `McpDiscovery`, and a client built without one (a test
+    /// or a misconfiguration) simply cannot dispatch tools.
+    async fn audit_dispatch(
+        &self,
+        id: &ServerId,
+        tool: &str,
+        chain: &CallChain,
+    ) -> Result<(), McpError> {
+        McpAuditRecord {
+            call_chain_id: chain.id,
+            depth: chain.depth,
+            server: id.0.clone(),
+            tool: tool.to_string(),
+            outcome: "dispatched",
+        }
+        .emit();
+        let sink = self.audit.as_ref().ok_or_else(|| {
+            McpError::AuditUnavailable(
+                "no audit sink configured; tool dispatch refused".to_string(),
+            )
+        })?;
+        // audit_dispatch runs only after the server was confirmed
+        // connected, so the server id is the trusted, resolved
+        // identifier. The tool name stays out of the Structural tier
+        // (it is in the `tracing` record above for debugging).
+        let event = crate::audit::mcp_event(
+            &id.0,
+            "dispatched",
+            chain.depth,
+            &chain.id.to_string(),
+            true,
+        );
+        sink.submit(event)
+            .await
+            .map_err(|e| McpError::AuditUnavailable(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Record one terminal tool-call outcome, best-effort.
+    ///
+    /// The `tracing` event is unconditional. When a sink is wired a
+    /// content-free ledger entry is also committed; the action has
+    /// already run (or been rejected) by the time this is reached, so
+    /// a sink failure is logged, not propagated.
+    /// `resolved` says whether the target server was confirmed
+    /// connected (a trusted, attested id) before this event; an
+    /// unresolved target's identifiers are caller-supplied and are
+    /// not persisted in the Structural tier (see
+    /// [`crate::audit::mcp_event`]).
+    async fn audit_outcome(
+        &self,
+        id: &ServerId,
+        tool: &str,
+        chain: &CallChain,
+        outcome: &'static str,
+        resolved: bool,
+    ) {
+        McpAuditRecord {
+            call_chain_id: chain.id,
+            depth: chain.depth,
+            server: id.0.clone(),
+            tool: tool.to_string(),
+            outcome,
+        }
+        .emit();
+        if let Some(sink) = &self.audit {
+            let event = crate::audit::mcp_event(
+                &id.0,
+                outcome,
+                chain.depth,
+                &chain.id.to_string(),
+                resolved,
+            );
+            if let Err(err) = sink.submit(event).await {
+                tracing::warn!("mcp audit submit failed: {err}");
+            }
+        }
     }
 }
 
@@ -601,7 +714,10 @@ mod tests {
     #[tokio::test]
     async fn call_tool_round_trips() {
         let (path, _server) = spawn_test_server().await;
-        let mut client = McpClient::new();
+        // A dispatching client must carry an audit sink; without one
+        // `call_tool` fails closed.
+        let mut client = McpClient::new()
+            .with_audit(Arc::new(crate::audit::MockAuditSink::accepting()));
         let id = ServerId("test".to_string());
         client.connect(id.clone(), &path, ServerClass::ReadOnly).await.expect("connect");
 
@@ -818,6 +934,96 @@ mod tests {
             .decide(&ServerId("nope".to_string()), "x", false)
             .expect_err("unknown server");
         assert!(matches!(err, McpError::UnknownServer(_)));
+    }
+
+    #[tokio::test]
+    async fn call_tool_with_an_audit_sink_records_dispatch_and_outcome() {
+        use crate::audit::{AuditKind, MockAuditSink};
+
+        let (path, _server) = spawn_test_server().await;
+        let sink = Arc::new(MockAuditSink::accepting());
+        let mut client = McpClient::new().with_audit(sink.clone());
+        let id = ServerId("test".to_string());
+        client
+            .connect(id.clone(), &path, ServerClass::ReadOnly)
+            .await
+            .expect("connect");
+
+        // A successful call commits two linked entries: a pre-dispatch
+        // gate entry and a post-hoc outcome entry.
+        client
+            .call_tool(&id, "greeting", serde_json::json!({}), &CallChain::root())
+            .await
+            .expect("call tool");
+        let recorded = sink.recorded().await;
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].kind, AuditKind::ToolCall);
+        // Subject is the bare attested server id, never the model's
+        // tool name.
+        assert_eq!(recorded[0].structural.subject, "test");
+        assert!(!recorded[0].structural.subject.contains("greeting"));
+        assert_eq!(recorded[0].structural.outcome, "dispatched");
+        assert_eq!(recorded[1].structural.outcome, "ok");
+
+        // A depth-exceeded call is a rejection: one policy-violation
+        // entry, and the server is never reached.
+        let mut deep = CallChain::root();
+        for _ in 0..DEFAULT_MAX_DEPTH {
+            deep = deep.nested();
+        }
+        let _ = client
+            .call_tool(&id, "greeting", serde_json::json!({}), &deep)
+            .await;
+        let recorded = sink.recorded().await;
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[2].kind, AuditKind::PolicyViolation);
+        assert_eq!(recorded[2].structural.outcome, "depth-exceeded");
+    }
+
+    #[tokio::test]
+    async fn call_tool_fails_closed_when_audit_is_unavailable() {
+        use crate::audit::MockAuditSink;
+
+        // The server would answer, but the audit ledger cannot record
+        // the dispatch entry. Foundation §8.4.6: the call must be
+        // refused, not run unaudited.
+        let (path, _server) = spawn_test_server().await;
+        let sink = Arc::new(MockAuditSink::failing());
+        let mut client = McpClient::new().with_audit(sink.clone());
+        let id = ServerId("test".to_string());
+        client
+            .connect(id.clone(), &path, ServerClass::ReadOnly)
+            .await
+            .expect("connect");
+
+        let err = client
+            .call_tool(&id, "greeting", serde_json::json!({}), &CallChain::root())
+            .await
+            .expect_err("audit-unavailable must refuse the call");
+        assert!(matches!(err, McpError::AuditUnavailable(_)), "got: {err:?}");
+        // Nothing was recorded (the failing sink stores nothing) and,
+        // by construction, the tool was never dispatched.
+        assert_eq!(sink.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn call_tool_without_a_sink_refuses_to_dispatch() {
+        // The fail-closed invariant is a property of `call_tool`, not
+        // of a wiring convention: a client with no audit sink cannot
+        // dispatch a tool, so an unaudited client cannot be used to
+        // run an action by mistake.
+        let (path, _server) = spawn_test_server().await;
+        let mut client = McpClient::new(); // no .with_audit(..)
+        let id = ServerId("test".to_string());
+        client
+            .connect(id.clone(), &path, ServerClass::ReadOnly)
+            .await
+            .expect("connect");
+        let err = client
+            .call_tool(&id, "greeting", serde_json::json!({}), &CallChain::root())
+            .await
+            .expect_err("a sinkless client must refuse to dispatch");
+        assert!(matches!(err, McpError::AuditUnavailable(_)), "got: {err:?}");
     }
 
     #[tokio::test]

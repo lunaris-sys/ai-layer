@@ -9,6 +9,7 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = "0.1"
+audit-proto = { path = "../../audit-proto" }
 hex = "0.4"
 rand = "0.8"
 rmcp = { version = "1.7", features = ["client"] }
@@ -23,3 +24,6 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 rmcp = { version = "1.7", features = ["client", "server", "macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+# The in-memory MockAuditSink is gated behind audit-proto's `test-util`
+# feature so it cannot reach a production build; the tests enable it.
+audit-proto = { path = "../../audit-proto", features = ["test-util"] }
