@@ -1,0 +1,21 @@
+[package]
+name = "lunaris-ai-sandbox"
+version = "0.1.0"
+edition = "2021"
+description = "Document-parsing isolation subprocess for the Lunaris AI layer. Parses untrusted documents in a seccomp + Landlock sandbox with no network and no filesystem access; only stripped text leaves."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "lunaris-doc-sandbox"
+path = "src/bin/lunaris-doc-sandbox.rs"
+
+[dependencies]
+thiserror = "2"
+tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+libc = "0.2"
