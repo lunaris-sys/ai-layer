@@ -34,6 +34,9 @@
 
 use thiserror::Error;
 
+#[cfg(feature = "onnx")]
+pub mod onnx;
+
 /// A prompt-injection likelihood for one piece of text: the probability
 /// in `0.0..=1.0` that the text contains AI-directed instructions.
 ///
@@ -196,6 +199,12 @@ pub struct ClassifierConfig {
     /// of a long input cannot slip past by being beyond the first
     /// window.
     pub max_tokens: usize,
+    /// The index of the "benign" label in the model's output logits.
+    /// The injection probability is `1 - softmax[benign]`, which maps a
+    /// specific export's label order onto the crate's uniform score.
+    /// Both Prompt-Guard and the ProtectAI DeBERTa models put benign at
+    /// index 0.
+    pub benign_label_index: usize,
     /// The warn threshold for [`ClassifierPolicy`].
     pub warn_at: f32,
     /// The block threshold for [`ClassifierPolicy`].

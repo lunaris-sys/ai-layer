@@ -2,11 +2,22 @@
 name = "lunaris-ai-classifier"
 version = "0.1.0"
 edition = "2021"
-description = "ONNX-based prompt-injection classifier for the Lunaris AI layer. Phase 9-γ S17 loads Meta's Prompt-Guard-86M and runs CPU inference."
+description = "ONNX-based prompt-injection classifier for the Lunaris AI layer. Phase 9-γ S17 loads a Prompt-Guard-class model and runs CPU inference."
 
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Default build ships only the model-agnostic surface (trait, score,
+# policy, fail-closed screen) with no native dependency. The `onnx`
+# feature adds the ort-backed classifier that loads the model and runs
+# CPU inference; it is off by default so the workspace and CI build
+# without the ONNX Runtime present.
+default = []
+onnx = ["dep:ort", "dep:tokenizers"]
+
 [dependencies]
 thiserror = "2"
 tracing = "0.1"
+ort = { version = "=2.0.0-rc.10", optional = true }
+tokenizers = { version = "0.20", optional = true }
