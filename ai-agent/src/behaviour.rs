@@ -233,6 +233,20 @@ fn default_reads() -> ReadScope {
     ReadScope::Minimal
 }
 
+/// A behaviour name must be a stable, identifier-safe token: lowercase
+/// ASCII alphanumerics joined by single hyphens, with no leading,
+/// trailing, or doubled hyphen. Constraining the charset makes the name
+/// safe to use as a directory name, a dispatch key, and a content-free
+/// audit subject — even though the manifest itself is untrusted.
+fn is_kebab_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && !s.contains("--")
+        && s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// A parsed behaviour: its manifest plus the markdown body.
 #[derive(Debug, Clone)]
 pub struct Behaviour {
@@ -317,6 +331,11 @@ fn validate(m: &BehaviourManifest, body: &str) -> Result<(), BehaviourError> {
 
     if m.name.trim().is_empty() {
         return reject("name must not be empty");
+    }
+    if !is_kebab_name(&m.name) {
+        return reject(
+            "name must be kebab-case: lowercase a-z, 0-9 and single '-' (e.g. auto-tag-by-project)",
+        );
     }
     if m.description.trim().is_empty() {
         return reject("description must not be empty");
@@ -645,5 +664,19 @@ terminal:
 goal
 "#;
         assert!(format!("{}", parse(huge).unwrap_err()).contains("ceiling"));
+    }
+
+    #[test]
+    fn rejects_non_kebab_names() {
+        for bad in ["Auto_Tag", "auto tag", "-leading", "trailing-", "dou--ble", "UPPER"] {
+            let src = format!(
+                "---\nname: \"{bad}\"\ndescription: d\nkind: workflow\nhandler: h\ntrigger:\n  type: manual\n---\n"
+            );
+            let err = parse(&src).unwrap_err();
+            assert!(
+                format!("{err}").contains("kebab-case"),
+                "expected kebab-case rejection for {bad:?}, got {err}"
+            );
+        }
     }
 }

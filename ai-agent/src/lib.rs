@@ -9,5 +9,6 @@
 #![warn(missing_docs)]
 
 pub mod behaviour;
+pub mod gate;
 pub mod loader;
 pub mod seams;

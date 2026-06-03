@@ -243,6 +243,51 @@ impl Capability {
             ActionMode::Autonomous => ActionDecision::Proceed,
         }
     }
+
+    /// Decide the gate for an action a *behaviour* proposes, combining the
+    /// behaviour's requested mode ceiling with the per-application grant.
+    ///
+    /// The behaviour's `ceiling` is a [`BaselineMode`] (Suggest or
+    /// Supervised, never Autonomous — a manifest cannot request autonomy).
+    /// It can only ever *narrow* authority: the effective mode is the
+    /// lesser of the ceiling and the per-app grant, so an untrusted
+    /// behaviour declaring Supervised can never widen a Suggest-only app,
+    /// and a Supervised ceiling caps an Autonomous app down to Supervised.
+    /// The two non-configurable overrides still apply first (and a ceiling
+    /// can never relax them): a high-impact [`ActionKind`] and any
+    /// externally-triggered action always require confirmation.
+    pub fn decide_for_behaviour(
+        &self,
+        app_id: &str,
+        kind: ActionKind,
+        triggered_by_external_content: bool,
+        ceiling: BaselineMode,
+    ) -> ActionDecision {
+        if kind.always_requires_confirmation() || triggered_by_external_content {
+            return ActionDecision::RequireConfirmation;
+        }
+        match narrow(self.actions.mode_for(app_id), ceiling) {
+            ActionMode::Suggest => ActionDecision::Propose,
+            ActionMode::Supervised => ActionDecision::PreviewThenExecute,
+            ActionMode::Autonomous => ActionDecision::Proceed,
+        }
+    }
+}
+
+/// Narrow a per-app granted [`ActionMode`] by a behaviour's requested
+/// [`BaselineMode`] ceiling. The result is never widened: a Suggest
+/// ceiling forces Suggest; a Supervised ceiling caps Autonomous (and
+/// Supervised) to Supervised. Autonomy can therefore never originate from
+/// a behaviour manifest — only from the per-app grant, and only when the
+/// behaviour's ceiling already permits at least Supervised.
+fn narrow(granted: ActionMode, ceiling: BaselineMode) -> ActionMode {
+    match ceiling {
+        BaselineMode::Suggest => ActionMode::Suggest,
+        BaselineMode::Supervised => match granted {
+            ActionMode::Suggest => ActionMode::Suggest,
+            ActionMode::Supervised | ActionMode::Autonomous => ActionMode::Supervised,
+        },
+    }
 }
 
 /// Map the global read access level (0..=4, Foundation §8.4 table) to
@@ -349,6 +394,56 @@ mod tests {
         assert_eq!(
             autonomous.decide("org.lunaris.files", ActionKind::Ordinary, false),
             ActionDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn behaviour_ceiling_only_narrows_never_widens() {
+        // The app is granted Autonomous.
+        let cap = Capability::new(
+            AccessTier::Full,
+            ActionPermissions::new(BaselineMode::Suggest, ["org.lunaris.files"]),
+        );
+        let app = "org.lunaris.files";
+
+        // A Supervised-ceiling behaviour caps the autonomous app to a
+        // preview-then-execute, never Proceed.
+        assert_eq!(
+            cap.decide_for_behaviour(app, ActionKind::Ordinary, false, BaselineMode::Supervised),
+            ActionDecision::PreviewThenExecute
+        );
+        // A Suggest-ceiling behaviour can only ever Propose.
+        assert_eq!(
+            cap.decide_for_behaviour(app, ActionKind::Ordinary, false, BaselineMode::Suggest),
+            ActionDecision::Propose
+        );
+
+        // Conversely the ceiling never *widens*: a Supervised behaviour
+        // under a Suggest-only app still only Proposes.
+        let suggest_app = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        assert_eq!(
+            suggest_app.decide_for_behaviour(
+                app,
+                ActionKind::Ordinary,
+                false,
+                BaselineMode::Supervised
+            ),
+            ActionDecision::Propose
+        );
+
+        // The non-configurable overrides still fire regardless of ceiling.
+        assert_eq!(
+            cap.decide_for_behaviour(
+                app,
+                ActionKind::PermanentDelete,
+                false,
+                BaselineMode::Supervised
+            ),
+            ActionDecision::RequireConfirmation
+        );
+        assert_eq!(
+            cap.decide_for_behaviour(app, ActionKind::Ordinary, true, BaselineMode::Supervised),
+            ActionDecision::RequireConfirmation
         );
     }
 
