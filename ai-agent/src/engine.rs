@@ -230,7 +230,6 @@ impl<'a> Dispatcher<'a> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use std::future::Future;
     use std::path::PathBuf;
 
     use audit_proto::MockAuditSink;
@@ -299,9 +298,8 @@ tools:
 
     struct VecSource(VecDeque<AgentEvent>);
     impl TriggerSource for VecSource {
-        fn recv(&mut self) -> impl Future<Output = Option<AgentEvent>> + Send {
-            let next = self.0.pop_front();
-            async move { next }
+        async fn recv(&mut self) -> Option<AgentEvent> {
+            self.0.pop_front()
         }
     }
 

@@ -20,6 +20,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+os-sdk = { path = "../../sdk/os-sdk" }
+prost = "0.13"
 
 [dev-dependencies]
 audit-proto = { path = "../../audit-proto", features = ["test-util"] }

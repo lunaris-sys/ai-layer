@@ -1276,6 +1276,8 @@ dependencies = [
  "audit-proto",
  "lunaris-ai-core",
  "lunaris-ai-providers",
+ "os-sdk",
+ "prost",
  "serde",
  "serde_yaml",
  "thiserror 2.0.18",
