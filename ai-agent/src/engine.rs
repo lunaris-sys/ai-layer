@@ -41,6 +41,7 @@ const AGENT_APP_ID: &str = "org.lunaris.agent";
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a workflow handler decides for a matched event.
+#[derive(Debug, Clone)]
 pub enum HandlerOutcome {
     /// Propose an action; it is gated before being surfaced/executed.
     Propose(ProposedAction),

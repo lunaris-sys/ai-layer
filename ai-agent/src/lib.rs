@@ -12,6 +12,7 @@ pub mod behaviour;
 pub mod engine;
 pub mod gate;
 pub mod graph;
+pub mod handlers;
 pub mod loader;
 pub mod router;
 pub mod seams;
