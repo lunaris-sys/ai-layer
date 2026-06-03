@@ -28,7 +28,7 @@
 //! discipline. The provider seam already exists as
 //! [`lunaris_ai_core::provider::AIProvider`] and is reused as-is.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::time::SystemTime;
 
@@ -137,6 +137,52 @@ pub struct AgentEvent {
 pub trait TriggerSource {
     /// The next event, or `None` when the source is exhausted / closed.
     fn recv(&mut self) -> impl Future<Output = Option<AgentEvent>> + Send;
+}
+
+/// A read-only Knowledge Graph handle a behaviour handler reads through.
+///
+/// Object-safe (via `async_trait`, unlike `os_sdk::GraphClient`'s RPITIT
+/// signature) so a handler can take `&dyn GraphHandle`: the production impl
+/// wraps `os_sdk::UnixGraphClient`, tests inject a mock returning canned
+/// rows. Each row is a column-name to JSON value map (the daemon's result
+/// shape). The read *scope* is enforced upstream — the engine refuses a
+/// behaviour whose declared read tier exceeds the configured grant, and the
+/// knowledge daemon scopes the query to the agent's tier.
+#[async_trait::async_trait]
+pub trait GraphHandle: Send + Sync {
+    /// Run a read-only Cypher query and return its rows.
+    async fn query(
+        &self,
+        cypher: &str,
+    ) -> Result<Vec<HashMap<String, serde_json::Value>>, GraphError>;
+}
+
+/// A graph read failure. Handlers generally fail closed on it (no proposal).
+#[derive(Debug, thiserror::Error)]
+pub enum GraphError {
+    /// The query could not be run or was rejected by the daemon.
+    #[error("graph read failed: {0}")]
+    Failed(String),
+}
+
+/// A [`GraphHandle`] that refuses every query. The dispatcher hands this to
+/// a behaviour declaring `reads: minimal` (no graph access) instead of a
+/// live handle, so a Minimal behaviour cannot read the graph even if its
+/// handler tries to. (Finer per-behaviour sub-tier scoping needs a
+/// per-query scope on the daemon request and is a separate follow-up.)
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeniedGraph;
+
+#[async_trait::async_trait]
+impl GraphHandle for DeniedGraph {
+    async fn query(
+        &self,
+        _cypher: &str,
+    ) -> Result<Vec<HashMap<String, serde_json::Value>>, GraphError> {
+        Err(GraphError::Failed(
+            "graph access denied: behaviour declares reads: minimal".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]

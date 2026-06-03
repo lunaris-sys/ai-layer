@@ -18,20 +18,27 @@
 //! follow-up that slots behind these same seams.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
-use lunaris_ai_core::capability::ActionDecision;
+use futures::FutureExt as _;
+use lunaris_ai_core::capability::{AccessTier, ActionDecision};
 
-use crate::behaviour::BehaviourKind;
+use crate::behaviour::{BehaviourKind, ReadScope};
 use crate::gate::{ActionContext, Gate, ProposedAction};
 use crate::loader::LoadedBehaviour;
 use crate::router::matching_behaviours;
-use crate::seams::{AgentEvent, TriggerSource};
+use crate::seams::{AgentEvent, DeniedGraph, GraphHandle, TriggerSource};
 
-/// The trusted app id the agent acts as in B1. Proper per-app resolution
-/// (from the tool binding / the behaviour identity) lands with the
-/// production wiring; until then the agent acts as itself, and B1 caps
-/// execution to confirmation regardless, so this never widens authority.
+/// The trusted app id the agent acts as for now. Proper per-app resolution
+/// (from the tool binding / the behaviour identity) lands later; until then
+/// the agent acts as itself, and execution is capped to confirmation
+/// regardless, so this never widens authority.
 const AGENT_APP_ID: &str = "org.lunaris.agent";
+
+/// Wall-clock bound on a single workflow handler run. A handler that blocks
+/// or runs away is abandoned with a Failed outcome rather than stalling the
+/// loop. (Agent-loop budgets, which are per-step, arrive separately.)
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a workflow handler decides for a matched event.
 pub enum HandlerOutcome {
@@ -48,14 +55,18 @@ pub enum HandlerOutcome {
 #[error("handler failed: {0}")]
 pub struct HandlerError(pub String);
 
-/// A workflow behaviour's code handler. Synchronous in B1 (stub / no I/O);
-/// when a handler needs to read the graph (the real `auto-tag-by-project`),
-/// it gains async + a read-scoped `GraphHandle` seam that lands with it.
-/// Returns a `Result` so a handler can fail gracefully; a *panic* is also
-/// caught by the dispatcher (see [`Dispatcher::dispatch`]).
+/// A workflow behaviour's code handler. Async, with a read-only
+/// [`GraphHandle`] for graph-backed behaviours. Returns a `Result` so a
+/// handler can fail gracefully; a *panic* or a timeout is also contained by
+/// the dispatcher (see [`Dispatcher::dispatch`]).
+#[async_trait::async_trait]
 pub trait WorkflowHandler: Send + Sync {
     /// Run the workflow for one matched event.
-    fn run(&self, event: &AgentEvent) -> Result<HandlerOutcome, HandlerError>;
+    async fn run(
+        &self,
+        event: &AgentEvent,
+        graph: &dyn GraphHandle,
+    ) -> Result<HandlerOutcome, HandlerError>;
 }
 
 /// Maps a behaviour manifest's `handler` id to its code handler.
@@ -104,11 +115,15 @@ pub enum DispatchOutcome {
     },
 }
 
-/// The dispatch engine over a set of loaded behaviours, their handlers, and
-/// the action gate.
+/// The dispatch engine over a set of loaded behaviours, their handlers, the
+/// graph handle they read through, and the action gate.
 pub struct Dispatcher<'a> {
     behaviours: &'a [LoadedBehaviour],
     handlers: &'a HandlerRegistry,
+    graph: &'a dyn GraphHandle,
+    /// The agent's configured global read tier; a behaviour declaring more
+    /// is refused before its handler runs.
+    read_tier: AccessTier,
     gate: Gate<'a>,
 }
 
@@ -117,11 +132,15 @@ impl<'a> Dispatcher<'a> {
     pub fn new(
         behaviours: &'a [LoadedBehaviour],
         handlers: &'a HandlerRegistry,
+        graph: &'a dyn GraphHandle,
+        read_tier: AccessTier,
         gate: Gate<'a>,
     ) -> Self {
         Self {
             behaviours,
             handlers,
+            graph,
+            read_tier,
             gate,
         }
     }
@@ -142,9 +161,21 @@ impl<'a> Dispatcher<'a> {
 
         // B1 runs workflow behaviours only; the bounded agent loop is B2.
         if m.kind != BehaviourKind::Workflow {
+            // The bounded agent loop is not run by this engine yet.
             return DispatchOutcome::Skipped {
                 behaviour,
-                reason: "agent behaviours run in B2".to_string(),
+                reason: "agent behaviours are not run by this engine yet".to_string(),
+            };
+        }
+        // Read scope: a behaviour may not read more of the graph than the
+        // agent is granted. Refused before the handler runs.
+        if !reads_satisfied(m.reads, self.read_tier) {
+            return DispatchOutcome::Skipped {
+                behaviour,
+                reason: format!(
+                    "declared read scope {:?} exceeds the configured grant",
+                    m.reads
+                ),
             };
         }
         let Some(handler_id) = m.handler.as_deref() else {
@@ -161,26 +192,42 @@ impl<'a> Dispatcher<'a> {
             };
         };
 
-        // Isolate handler failures *and* panics: a malformed event or a
-        // buggy handler produces a Failed outcome and the dispatcher moves
-        // on to the next behaviour, rather than stalling the whole loop.
-        // (A handler that *blocks* is only bounded once handlers are async
-        // and a per-handler timeout lands with the GraphHandle seam.)
-        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.run(event)));
-        let outcome = match run {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(e)) => {
+        // A Minimal-reads behaviour gets no graph access (a denying handle),
+        // so its declared scope is enforced on the actual query, not just at
+        // enablement. Finer per-behaviour sub-tier scoping (e.g. capping a
+        // session-scoped behaviour under a full grant) needs a per-query
+        // scope on the daemon request and is a documented follow-up.
+        let denied = DeniedGraph;
+        let graph: &dyn GraphHandle = if m.reads == ReadScope::Minimal {
+            &denied
+        } else {
+            self.graph
+        };
+
+        // Run the handler under a timeout and panic isolation, so a runaway,
+        // blocking, or panicking handler yields a Failed outcome and the
+        // dispatch of the other behaviours continues.
+        let guarded = std::panic::AssertUnwindSafe(handler.run(event, graph)).catch_unwind();
+        let outcome = match tokio::time::timeout(HANDLER_TIMEOUT, guarded).await {
+            Err(_elapsed) => {
                 return DispatchOutcome::Failed {
                     behaviour,
-                    reason: e.to_string(),
+                    reason: "handler timed out".to_string(),
                 }
             }
-            Err(_) => {
+            Ok(Err(_panic)) => {
                 return DispatchOutcome::Failed {
                     behaviour,
                     reason: "handler panicked".to_string(),
                 }
             }
+            Ok(Ok(Err(e))) => {
+                return DispatchOutcome::Failed {
+                    behaviour,
+                    reason: e.to_string(),
+                }
+            }
+            Ok(Ok(Ok(outcome))) => outcome,
         };
 
         match outcome {
@@ -226,18 +273,30 @@ impl<'a> Dispatcher<'a> {
     }
 }
 
+/// Whether a behaviour's declared read scope is satisfied by the agent's
+/// configured grant. Conservative: Minimal needs nothing, Full grants
+/// everything, otherwise the tiers must match exactly. The access tiers are
+/// non-nested label *lenses* (e.g. project-scoped grants `Project` but
+/// time-scoped does not), so a precise superset check needs the schema and
+/// belongs to the read/grounding layer; this conservative form never
+/// over-grants (it may refuse a satisfiable combination, fail-safe).
+fn reads_satisfied(needs: ReadScope, granted: AccessTier) -> bool {
+    needs == ReadScope::Minimal || granted == AccessTier::Full || needs.tier() == granted
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::path::PathBuf;
 
     use audit_proto::MockAuditSink;
     use lunaris_ai_core::capability::{AccessTier, ActionPermissions, Capability};
 
     use crate::behaviour::parse;
-    use crate::loader::{LoadedBehaviour, Provenance, Status};
-    use crate::seams::NullObserver;
+    use crate::loader::{DisableReason, LoadedBehaviour, Provenance, Status};
+    use crate::seams::{GraphError, NullObserver};
 
     const AUTO_TAG: &str = r#"---
 name: auto-tag-by-project
@@ -272,9 +331,26 @@ tools:
         }
     }
 
+    /// A graph that returns nothing — handlers under test do not query it.
+    struct EmptyGraph;
+    #[async_trait::async_trait]
+    impl GraphHandle for EmptyGraph {
+        async fn query(
+            &self,
+            _cypher: &str,
+        ) -> Result<Vec<HashMap<String, serde_json::Value>>, GraphError> {
+            Ok(Vec::new())
+        }
+    }
+
     struct StubPropose;
+    #[async_trait::async_trait]
     impl WorkflowHandler for StubPropose {
-        fn run(&self, _event: &AgentEvent) -> Result<HandlerOutcome, HandlerError> {
+        async fn run(
+            &self,
+            _event: &AgentEvent,
+            _graph: &dyn GraphHandle,
+        ) -> Result<HandlerOutcome, HandlerError> {
             Ok(HandlerOutcome::Propose(ProposedAction {
                 tool: "graph.write".to_string(),
                 summary: "tag the opened file".to_string(),
@@ -283,15 +359,25 @@ tools:
     }
 
     struct StubTerminal;
+    #[async_trait::async_trait]
     impl WorkflowHandler for StubTerminal {
-        fn run(&self, _event: &AgentEvent) -> Result<HandlerOutcome, HandlerError> {
+        async fn run(
+            &self,
+            _event: &AgentEvent,
+            _graph: &dyn GraphHandle,
+        ) -> Result<HandlerOutcome, HandlerError> {
             Ok(HandlerOutcome::Terminal("no_matching_project".to_string()))
         }
     }
 
     struct StubPanic;
+    #[async_trait::async_trait]
     impl WorkflowHandler for StubPanic {
-        fn run(&self, _event: &AgentEvent) -> Result<HandlerOutcome, HandlerError> {
+        async fn run(
+            &self,
+            _event: &AgentEvent,
+            _graph: &dyn GraphHandle,
+        ) -> Result<HandlerOutcome, HandlerError> {
             panic!("handler blew up");
         }
     }
@@ -307,7 +393,7 @@ tools:
         [("auto_tag_by_project".to_string(), handler)].into_iter().collect()
     }
 
-    fn suggest_gate<'a>(audit: &'a MockAuditSink, obs: &'a NullObserver, cap: &'a Capability) -> Gate<'a> {
+    fn gate<'a>(audit: &'a MockAuditSink, obs: &'a NullObserver, cap: &'a Capability) -> Gate<'a> {
         Gate::new(cap, audit, obs)
     }
 
@@ -318,8 +404,10 @@ tools:
         let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
         let audit = MockAuditSink::accepting();
         let obs = NullObserver;
+        let graph = EmptyGraph;
 
-        let dispatcher = Dispatcher::new(&behaviours, &handlers, suggest_gate(&audit, &obs, &cap));
+        let dispatcher =
+            Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, gate(&audit, &obs, &cap));
         let outcomes = dispatcher.dispatch(&event("~/Repositories/foo.rs")).await;
 
         assert_eq!(outcomes.len(), 1);
@@ -331,27 +419,49 @@ tools:
                 audit_index: 0,
             }
         );
-        // The decision was audited (content-free, correlated).
         let recorded = audit.recorded().await;
         assert_eq!(recorded[0].structural.subject, "agent.auto-tag-by-project");
         assert_eq!(recorded[0].call_chain_id.as_deref(), Some("e1:auto-tag-by-project"));
     }
 
     #[tokio::test]
-    async fn filtered_event_dispatches_to_nothing() {
-        let behaviours = [loaded(AUTO_TAG, Status::Enabled)];
+    async fn filtered_or_disabled_dispatches_to_nothing() {
         let handlers = registry(Box::new(StubPropose));
         let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
         let audit = MockAuditSink::accepting();
         let obs = NullObserver;
-        let dispatcher = Dispatcher::new(&behaviours, &handlers, suggest_gate(&audit, &obs, &cap));
+        let graph = EmptyGraph;
 
-        // ~/.cache is excluded by the behaviour's filter, and a disabled
-        // behaviour never matches.
-        assert!(dispatcher.dispatch(&event("~/.cache/x")).await.is_empty());
-        let disabled = [loaded(AUTO_TAG, Status::Disabled(crate::loader::DisableReason::NotEnabledInSettings))];
-        let d2 = Dispatcher::new(&disabled, &handlers, suggest_gate(&audit, &obs, &cap));
+        let enabled = [loaded(AUTO_TAG, Status::Enabled)];
+        let d = Dispatcher::new(&enabled, &handlers, &graph, AccessTier::Full, gate(&audit, &obs, &cap));
+        // ~/.cache is excluded by the filter.
+        assert!(d.dispatch(&event("~/.cache/x")).await.is_empty());
+
+        let disabled = [loaded(AUTO_TAG, Status::Disabled(DisableReason::NotEnabledInSettings))];
+        let d2 = Dispatcher::new(&disabled, &handlers, &graph, AccessTier::Full, gate(&audit, &obs, &cap));
         assert!(d2.dispatch(&event("~/foo.rs")).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_read_scope_above_the_grant_is_skipped() {
+        // auto-tag declares reads: project; under a session-only grant it
+        // must not run.
+        let behaviours = [loaded(AUTO_TAG, Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::SessionScoped, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let dispatcher = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::SessionScoped,
+            gate(&audit, &obs, &cap),
+        );
+        let outcomes = dispatcher.dispatch(&event("~/foo.rs")).await;
+        assert!(matches!(outcomes[0], DispatchOutcome::Skipped { .. }));
+        assert_eq!(audit.count().await, 0);
     }
 
     #[tokio::test]
@@ -361,7 +471,9 @@ tools:
         let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
         let audit = MockAuditSink::accepting();
         let obs = NullObserver;
-        let dispatcher = Dispatcher::new(&behaviours, &handlers, suggest_gate(&audit, &obs, &cap));
+        let graph = EmptyGraph;
+        let dispatcher =
+            Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, gate(&audit, &obs, &cap));
 
         let outcomes = dispatcher.dispatch(&event("~/foo.rs")).await;
         assert_eq!(
@@ -371,18 +483,19 @@ tools:
                 outcome: "no_matching_project".to_string(),
             }
         );
-        // A terminal (no action) is not audited as a gate decision.
         assert_eq!(audit.count().await, 0);
     }
 
     #[tokio::test]
     async fn unregistered_handler_is_skipped_not_run() {
         let behaviours = [loaded(AUTO_TAG, Status::Enabled)];
-        let handlers: HandlerRegistry = BTreeMap::new(); // nothing registered
+        let handlers: HandlerRegistry = BTreeMap::new();
         let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
         let audit = MockAuditSink::accepting();
         let obs = NullObserver;
-        let dispatcher = Dispatcher::new(&behaviours, &handlers, suggest_gate(&audit, &obs, &cap));
+        let graph = EmptyGraph;
+        let dispatcher =
+            Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, gate(&audit, &obs, &cap));
 
         let outcomes = dispatcher.dispatch(&event("~/foo.rs")).await;
         assert!(matches!(outcomes[0], DispatchOutcome::Skipped { .. }));
@@ -396,11 +509,12 @@ tools:
         let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
         let audit = MockAuditSink::accepting();
         let obs = NullObserver;
-        let dispatcher = Dispatcher::new(&behaviours, &handlers, suggest_gate(&audit, &obs, &cap));
+        let graph = EmptyGraph;
+        let dispatcher =
+            Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, gate(&audit, &obs, &cap));
 
         let mut source = VecSource(VecDeque::from([event("~/a.rs"), event("~/b.rs")]));
         dispatcher.run(&mut source).await;
-        // Both events dispatched + audited.
         assert_eq!(audit.count().await, 2);
     }
 
@@ -411,10 +525,12 @@ tools:
         let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
         let audit = MockAuditSink::accepting();
         let obs = NullObserver;
-        let dispatcher = Dispatcher::new(&behaviours, &handlers, suggest_gate(&audit, &obs, &cap));
+        let graph = EmptyGraph;
+        let dispatcher =
+            Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, gate(&audit, &obs, &cap));
 
         let mut ev = event("~/foo.rs");
-        ev.external_content = true; // a run triggered by external content
+        ev.external_content = true;
         let outcomes = dispatcher.dispatch(&ev).await;
         assert_eq!(
             outcomes[0],
@@ -433,11 +549,72 @@ tools:
         let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
         let audit = MockAuditSink::accepting();
         let obs = NullObserver;
-        let dispatcher = Dispatcher::new(&behaviours, &handlers, suggest_gate(&audit, &obs, &cap));
+        let graph = EmptyGraph;
+        let dispatcher =
+            Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, gate(&audit, &obs, &cap));
 
         let outcomes = dispatcher.dispatch(&event("~/foo.rs")).await;
         assert!(matches!(outcomes[0], DispatchOutcome::Failed { .. }));
-        // A failed handler produced no gate decision to audit.
         assert_eq!(audit.count().await, 0);
+    }
+
+    const MINIMAL_PROBE: &str = r#"---
+name: probe-graph
+description: A minimal-reads probe behaviour.
+kind: workflow
+handler: auto_tag_by_project
+reads: minimal
+trigger:
+  type: event
+  event: file.opened
+---
+"#;
+
+    // A handler that probes the graph and reports whether the read worked.
+    struct StubQuery;
+    #[async_trait::async_trait]
+    impl WorkflowHandler for StubQuery {
+        async fn run(
+            &self,
+            _event: &AgentEvent,
+            graph: &dyn GraphHandle,
+        ) -> Result<HandlerOutcome, HandlerError> {
+            let outcome = match graph.query("MATCH (p:Project) RETURN p").await {
+                Ok(_) => "queried",
+                Err(_) => "denied",
+            };
+            Ok(HandlerOutcome::Terminal(outcome.to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn minimal_reads_behaviour_is_denied_graph_access() {
+        let handlers = registry(Box::new(StubQuery));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph; // would answer Ok(empty) if the handler reached it
+
+        // A minimal-reads behaviour gets a denying handle: its query fails.
+        let minimal = [loaded(MINIMAL_PROBE, Status::Enabled)];
+        let d = Dispatcher::new(&minimal, &handlers, &graph, AccessTier::Full, gate(&audit, &obs, &cap));
+        assert_eq!(
+            d.dispatch(&event("~/foo.rs")).await[0],
+            DispatchOutcome::Terminal {
+                behaviour: "probe-graph".to_string(),
+                outcome: "denied".to_string(),
+            }
+        );
+
+        // A project-reads behaviour reaches the real graph (here EmptyGraph).
+        let project = [loaded(AUTO_TAG, Status::Enabled)];
+        let d2 = Dispatcher::new(&project, &handlers, &graph, AccessTier::Full, gate(&audit, &obs, &cap));
+        assert_eq!(
+            d2.dispatch(&event("~/foo.rs")).await[0],
+            DispatchOutcome::Terminal {
+                behaviour: "auto-tag-by-project".to_string(),
+                outcome: "queried".to_string(),
+            }
+        );
     }
 }
