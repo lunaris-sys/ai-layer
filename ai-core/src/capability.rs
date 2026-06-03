@@ -48,7 +48,13 @@ pub enum ActionMode {
 /// "autonomous mode is never a global setting", so the daemon-wide
 /// default can only ever be Suggest or Supervised. Autonomy is granted
 /// per application through [`ActionPermissions::autonomous_apps`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Deserialize` is derived so a behaviour manifest can name its requested
+/// default mode (`mode: supervised`). It is deliberately `BaselineMode`,
+/// not [`ActionMode`]: a manifest must not be able to request `autonomous`
+/// — autonomy is only ever granted per application, outside the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BaselineMode {
     /// Propose actions; the user executes them.
     Suggest,
