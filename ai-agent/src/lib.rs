@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 pub mod behaviour;
+pub mod engine;
 pub mod gate;
 pub mod loader;
 pub mod router;

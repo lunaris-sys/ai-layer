@@ -28,6 +28,8 @@
 //! discipline. The provider seam already exists as
 //! [`lunaris_ai_core::provider::AIProvider`] and is reused as-is.
 
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::time::SystemTime;
 
 use lunaris_ai_core::capability::ActionDecision;
@@ -103,6 +105,38 @@ pub struct NullObserver;
 
 impl GateObserver for NullObserver {
     fn observed(&self, _decision: &ActionDecision) {}
+}
+
+/// A decoded Event Bus event the router and engine act on: its type plus a
+/// flat map of payload fields. The production [`TriggerSource`] decodes the
+/// prost `Event` (type + the per-payload fields the router needs); tests
+/// construct these directly.
+#[derive(Debug, Clone)]
+pub struct AgentEvent {
+    /// The event's stable id (from the Event envelope), used to correlate
+    /// the resulting gate/audit entries.
+    pub id: String,
+    /// The event type string, e.g. `file.opened`.
+    pub event_type: String,
+    /// The payload fields the router/filters read (e.g. `path`, `app_id`).
+    pub fields: BTreeMap<String, String>,
+    /// Whether this event carries (or was triggered by) external content —
+    /// a trusted origin fact the [`TriggerSource`] decoder stamps from the
+    /// event source (S18-A origin tagging). Any action triggered by it must
+    /// be confirmed (prompt-injection containment), so the production
+    /// decoder defaults an *unknown* origin to `true` (fail-safe); a local
+    /// system event (e.g. `file.opened` from the kernel layer) is `false`.
+    pub external_content: bool,
+}
+
+/// The source of trigger events the engine consumes. The production impl
+/// wraps the Event Bus consumer (decoding each frame into an
+/// [`AgentEvent`]); tests inject a queue. Returning `impl Future + Send`
+/// rather than a bare `async fn` keeps the auto-trait bound explicit (and
+/// avoids the `async_fn_in_trait` lint) for use behind the engine loop.
+pub trait TriggerSource {
+    /// The next event, or `None` when the source is exhausted / closed.
+    fn recv(&mut self) -> impl Future<Output = Option<AgentEvent>> + Send;
 }
 
 #[cfg(test)]
