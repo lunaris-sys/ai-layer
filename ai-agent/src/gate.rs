@@ -72,7 +72,7 @@ use crate::seams::GateObserver;
 /// applies, label its own risk, or claim non-external provenance. The
 /// `summary` is for the proposal/preview UI and is never audited (the
 /// audit subject is content-free).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposedAction {
     /// The MCP tool / operation the behaviour wants to invoke. Classified
     /// by the shared always-confirm classifier and checked against the

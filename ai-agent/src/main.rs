@@ -215,10 +215,12 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
     match outcome {
         DispatchOutcome::Decided {
             behaviour,
+            action,
             decision,
             audit_index,
         } => tracing::info!(
             behaviour = %behaviour,
+            summary = %action.summary,
             ?decision,
             audit_index = *audit_index,
             "behaviour decision gated and audited"

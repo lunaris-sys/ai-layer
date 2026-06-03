@@ -80,6 +80,10 @@ pub enum DispatchOutcome {
     Decided {
         /// The behaviour that ran.
         behaviour: String,
+        /// The action the gate decided on, carried so a surface can show it
+        /// to the user (the summary is for display; the audit subject stays
+        /// content-free).
+        action: ProposedAction,
         /// The gate's decision.
         decision: ActionDecision,
         /// The audit ledger index of the recorded decision.
@@ -251,6 +255,7 @@ impl<'a> Dispatcher<'a> {
                 {
                     Ok(receipt) => DispatchOutcome::Decided {
                         behaviour,
+                        action,
                         decision: receipt.decision,
                         audit_index: receipt.audit_index,
                     },
@@ -416,6 +421,10 @@ tools:
             outcomes[0],
             DispatchOutcome::Decided {
                 behaviour: "auto-tag-by-project".to_string(),
+                action: ProposedAction {
+                    tool: "graph.write".to_string(),
+                    summary: "tag the opened file".to_string(),
+                },
                 decision: ActionDecision::Propose,
                 audit_index: 0,
             }
@@ -537,6 +546,10 @@ tools:
             outcomes[0],
             DispatchOutcome::Decided {
                 behaviour: "auto-tag-by-project".to_string(),
+                action: ProposedAction {
+                    tool: "graph.write".to_string(),
+                    summary: "tag the opened file".to_string(),
+                },
                 decision: ActionDecision::RequireConfirmation,
                 audit_index: 0,
             }
