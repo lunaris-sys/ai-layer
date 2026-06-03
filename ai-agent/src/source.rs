@@ -8,14 +8,32 @@
 //! The decode is pure and unit-tested; the subscription itself is thin I/O
 //! exercised only against a live bus.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use os_sdk::proto::{Event, FileOpenedPayload, WindowFocusedPayload};
 use os_sdk::{EventConsumer, SubscribeError, UnixEventConsumer};
 use prost::Message as _;
 use tokio::sync::mpsc;
 
+use crate::behaviour::TriggerKind;
+use crate::loader::LoadedBehaviour;
 use crate::seams::{AgentEvent, TriggerSource};
+
+/// The Event Bus type filters to subscribe to: the event pattern of every
+/// enabled, event-triggered behaviour. Schedule and manual triggers are not
+/// bus subscriptions (a scheduler / explicit invocation drives those), so
+/// they contribute nothing here.
+pub fn subscription_types(behaviours: &[LoadedBehaviour]) -> Vec<String> {
+    let mut types: BTreeSet<String> = BTreeSet::new();
+    for lb in behaviours {
+        if lb.status.is_enabled() && lb.behaviour.manifest.trigger.kind == TriggerKind::Event {
+            if let Some(event) = &lb.behaviour.manifest.trigger.event {
+                types.insert(event.clone());
+            }
+        }
+    }
+    types.into_iter().collect()
+}
 
 /// The Event Bus consumer socket. The daemon resolves the real path from
 /// `LUNARIS_CONSUMER_SOCKET` (with this as the fallback).
@@ -158,5 +176,33 @@ mod tests {
         let agent_event = decode_event(ev);
         assert_eq!(agent_event.event_type, "file.opened");
         assert!(agent_event.fields.is_empty()); // filters then fail closed
+    }
+
+    #[test]
+    fn subscription_types_collects_enabled_event_triggers() {
+        use crate::behaviour::parse;
+        use crate::loader::{LoadedBehaviour, Provenance, Status};
+        use std::path::PathBuf;
+
+        let load = |skill: &str, status: Status| LoadedBehaviour {
+            behaviour: parse(skill).expect("valid"),
+            provenance: Provenance::BuiltIn,
+            dir: PathBuf::from("/test"),
+            status,
+        };
+        let event_wf = |name: &str, event: &str| {
+            format!("---\nname: {name}\ndescription: d\nkind: workflow\nhandler: h\ntrigger:\n  type: event\n  event: {event}\n---\n")
+        };
+        let behaviours = [
+            load(&event_wf("a", "file.opened"), Status::Enabled),
+            load(&event_wf("b", "window.focused"), Status::Enabled),
+            // Disabled behaviours and schedule/manual triggers contribute nothing.
+            load(&event_wf("c", "clipboard.copy"), Status::Disabled(crate::loader::DisableReason::NotEnabledInSettings)),
+            load("---\nname: d\ndescription: d\nkind: workflow\nhandler: h\ntrigger:\n  type: manual\n---\n", Status::Enabled),
+        ];
+        assert_eq!(
+            subscription_types(&behaviours),
+            vec!["file.opened".to_string(), "window.focused".to_string()]
+        );
     }
 }
