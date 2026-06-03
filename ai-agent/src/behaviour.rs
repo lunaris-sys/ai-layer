@@ -351,6 +351,14 @@ fn validate(m: &BehaviourManifest, body: &str) -> Result<(), BehaviourError> {
             if t.every_secs.is_some() {
                 return reject("an event trigger must not set `every_secs`");
             }
+            // Reject a malformed filter at load time, so the router never
+            // sees one (it would otherwise fail-closed and silently never
+            // match).
+            if let Some(expr) = &t.filter {
+                if let Err(e) = crate::router::Filter::parse(expr) {
+                    return reject(&format!("invalid trigger filter: {e}"));
+                }
+            }
         }
         TriggerKind::Schedule => {
             match t.every_secs {
@@ -678,5 +686,23 @@ goal
                 "expected kebab-case rejection for {bad:?}, got {err}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_a_malformed_trigger_filter() {
+        // A filter that is not `<field> <op> <value>` is caught at load.
+        let src = r#"---
+name: x
+description: d
+kind: workflow
+handler: h
+trigger:
+  type: event
+  event: file.opened
+  filter: "path startswith"
+---
+"#;
+        let err = parse(src).unwrap_err();
+        assert!(format!("{err}").contains("filter"), "got: {err}");
     }
 }

@@ -11,4 +11,5 @@
 pub mod behaviour;
 pub mod gate;
 pub mod loader;
+pub mod router;
 pub mod seams;
