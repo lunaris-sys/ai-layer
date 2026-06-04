@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use os_sdk::{GraphClient, UnixGraphClient};
+use os_sdk::UnixGraphClient;
 
 use crate::seams::{GraphError, GraphHandle};
 
@@ -20,13 +20,12 @@ pub const DEFAULT_GRAPH_SOCKET: &str = "/run/lunaris/knowledge.sock";
 /// socket.
 ///
 /// Each query uses a **fresh** client (and therefore a fresh connection).
-/// `UnixGraphClient` caches a persistent socket and only resets it on an
-/// explicit I/O error, not when a future is dropped; under the dispatcher's
-/// per-handler timeout a query future can be cancelled mid-I/O, which would
-/// leave a shared cached stream desynchronised and corrupt the *next*
-/// query. A per-query client makes a timed-out query drop only its own
-/// connection, so cancellation is safe. (The agent's query rate is low, so
-/// the reconnect cost is acceptable.)
+/// `UnixGraphClient` is itself cancellation-safe (it takes its cached stream
+/// out of the mutex for the duration of a round trip, so a dropped future
+/// never leaves a desynchronised socket for the next query), but a per-query
+/// client keeps this handle stateless and isolates any per-connection error
+/// to the single query that hit it. The agent's query rate is low, so the
+/// reconnect cost is acceptable.
 pub struct UnixGraph {
     socket_path: String,
 }
@@ -46,8 +45,11 @@ impl GraphHandle for UnixGraph {
         &self,
         cypher: &str,
     ) -> Result<Vec<HashMap<String, serde_json::Value>>, GraphError> {
+        // Use the daemon's typed structured-row mode, not the legacy text
+        // mode: a behaviour reads `row["id"]` as a properly-typed value, and a
+        // graph string containing a delimiter or newline cannot forge a row.
         UnixGraphClient::new(self.socket_path.clone())
-            .query(cypher, HashMap::new())
+            .query_rows(cypher)
             .await
             .map_err(|e| GraphError::Failed(e.to_string()))
     }
