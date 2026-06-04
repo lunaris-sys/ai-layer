@@ -10,6 +10,7 @@
 
 pub mod agentic;
 pub mod behaviour;
+pub mod compaction;
 pub mod config;
 pub mod engine;
 pub mod gate;

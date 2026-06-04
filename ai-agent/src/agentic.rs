@@ -11,6 +11,7 @@ use lunaris_ai_core::tagging::{Block, Origin, TaggedPrompt};
 use serde::Deserialize;
 
 use crate::behaviour::Behaviour;
+use crate::compaction::{self, TranscriptEntry};
 use crate::seams::AgentEvent;
 
 /// One step the model takes in the bounded loop: either propose a single
@@ -98,7 +99,7 @@ pub fn parse_agent_step(text: &str) -> Result<AgentStep, String> {
 pub fn build_agent_prompt(
     behaviour: &Behaviour,
     event: &AgentEvent,
-    transcript: &[String],
+    transcript: &[TranscriptEntry],
 ) -> String {
     let manifest = &behaviour.manifest;
     let tools = if manifest.tools.is_empty() {
@@ -152,7 +153,7 @@ pub fn build_agent_prompt(
         }
         s
     };
-    let transcript_block = transcript.join("\n");
+    let transcript_block = compaction::render(transcript);
 
     let mut blocks = vec![Block {
         origin: if event.external_content {
@@ -248,10 +249,16 @@ mod tests {
     #[test]
     fn external_event_is_tagged_as_external_content() {
         let b = agent_behaviour(DEMO_AGENT);
-        let prompt = build_agent_prompt(&b, &opened("~/x.rs", true), &["step 0: did a thing".to_string()]);
+        let transcript = [TranscriptEntry::Proposed {
+            step: 0,
+            tool: "graph.write".to_string(),
+            summary: "tag foo".to_string(),
+            decision: "Propose".to_string(),
+        }];
+        let prompt = build_agent_prompt(&b, &opened("~/x.rs", true), &transcript);
         assert!(prompt.contains("[EXTERNAL-CONTENT-"));
         // The transcript is fed back as model feedback, also data.
         assert!(prompt.contains("[PRIOR-ERROR-"));
-        assert!(prompt.contains("step 0: did a thing"));
+        assert!(prompt.contains("step 0: proposed graph.write"));
     }
 }

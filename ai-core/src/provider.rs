@@ -72,4 +72,21 @@ pub trait AIProvider: Send + Sync {
 
     /// Human-readable identifier used in routing rules and audit log entries.
     fn name(&self) -> &str;
+
+    /// The model's usable input context window, in tokens. Callers that must
+    /// keep a prompt inside the window (the agent loop's compaction) read it
+    /// here, so the bound tracks the wired model rather than a guess.
+    ///
+    /// The default is a deliberately low, safe value: a provider that does not
+    /// override it makes callers compact early and fail closed rather than
+    /// overflow a real backend. **A concrete adapter wired into the agent loop
+    /// MUST override this with its model's real input window (from provider
+    /// configuration or catalog metadata); the fallback is intentionally too
+    /// small for a real model and will over-compact or refuse otherwise-valid
+    /// large prompts.** That override is part of wiring a provider into the
+    /// loop (the loop runs with no provider until then, so the fallback has no
+    /// live effect on it yet).
+    fn context_window(&self) -> u32 {
+        8_192
+    }
 }

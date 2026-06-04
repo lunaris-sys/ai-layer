@@ -25,7 +25,8 @@ use lunaris_ai_core::capability::{AccessTier, ActionDecision};
 use lunaris_ai_core::provider::{AIProvider, CompletionRequest};
 
 use crate::agentic::{build_agent_prompt, parse_agent_step, AgentStep};
-use crate::behaviour::{BehaviourKind, ReadScope};
+use crate::behaviour::{Behaviour, BehaviourKind, ReadScope};
+use crate::compaction::{self, CompactionPolicy, TranscriptEntry};
 use crate::gate::{ActionContext, Gate, GateError, ProposedAction};
 use crate::loader::LoadedBehaviour;
 use crate::router::matching_behaviours;
@@ -141,10 +142,16 @@ pub struct Dispatcher<'a> {
     /// The clock the agent loop measures its wall-clock budget against
     /// (a seam so the budget is deterministic under test).
     clock: &'a dyn Clock,
+    /// How the agent loop keeps its working memory inside the model's
+    /// context window. Defaults to a conservative fixed buffer; the daemon
+    /// (and the provider, once wired) can override it via
+    /// [`Dispatcher::with_compaction`].
+    compaction: CompactionPolicy,
 }
 
 impl<'a> Dispatcher<'a> {
-    /// Build a dispatcher.
+    /// Build a dispatcher. The compaction policy defaults to a conservative
+    /// fixed buffer; override it with [`Dispatcher::with_compaction`].
     pub fn new(
         behaviours: &'a [LoadedBehaviour],
         handlers: &'a HandlerRegistry,
@@ -162,7 +169,15 @@ impl<'a> Dispatcher<'a> {
             gate,
             provider,
             clock,
+            compaction: CompactionPolicy::default(),
         }
+    }
+
+    /// Override the context-compaction policy (e.g. with the real model's
+    /// window once a provider is wired).
+    pub fn with_compaction(mut self, policy: CompactionPolicy) -> Self {
+        self.compaction = policy;
+        self
     }
 
     /// Dispatch one event: route it to every enabled matching behaviour and
@@ -317,8 +332,9 @@ impl<'a> Dispatcher<'a> {
     ///
     /// Returns one outcome per gated step plus a terminal outcome naming why
     /// the loop ended (the declared terminal name, `budget_steps`,
-    /// `budget_tokens`, `budget_wall_ms`), or a single `Failed` on a provider
-    /// error or an audit outage.
+    /// `budget_tokens`, `budget_wall_ms`, or `budget_context` when the prompt
+    /// cannot be compacted under the model's context window), or a single
+    /// `Failed` on a provider error or an audit outage.
     async fn run_agent_loop(
         &self,
         lb: &LoadedBehaviour,
@@ -357,9 +373,12 @@ impl<'a> Dispatcher<'a> {
         };
 
         let mut outcomes = Vec::new();
-        let mut transcript: Vec<String> = Vec::new();
+        let mut transcript: Vec<TranscriptEntry> = Vec::new();
         let mut tokens_spent: u32 = 0;
         let start = self.clock.now();
+        // The model's input window, from the wired provider, so the
+        // context-window guard tracks the real backend rather than a guess.
+        let window = provider.context_window();
 
         for step in 0..budget.max_steps {
             // Monotonic-safe: if the wall clock moved backwards, treat the
@@ -381,6 +400,23 @@ impl<'a> Dispatcher<'a> {
                 outcomes.push(DispatchOutcome::Terminal {
                     behaviour,
                     outcome: "budget_tokens".to_string(),
+                });
+                return outcomes;
+            }
+
+            // Keep the working memory inside the model's context window before
+            // building this step's prompt: a deterministic, model-free prune
+            // (collapse redundant correction feedback) then tighten (drop the
+            // rationale prose of older proposals, keeping every tool, decision,
+            // and refusal verbatim). If it still will not fit, terminate closed
+            // rather than send an over-window prompt or drop a load-bearing
+            // fact. This makes no model call, so it spends no budget here.
+            if let CompactionOutcome::OverWindow =
+                compact_for_window(&lb.behaviour, event, &mut transcript, window, &self.compaction)
+            {
+                outcomes.push(DispatchOutcome::Terminal {
+                    behaviour,
+                    outcome: "budget_context".to_string(),
                 });
                 return outcomes;
             }
@@ -409,12 +445,16 @@ impl<'a> Dispatcher<'a> {
             }
             let request = CompletionRequest {
                 prompt,
-                // Advisory output cap: the headroom after input, so a provider
-                // that honours `extras` keeps input+output within budget. The
-                // post-call accounting still enforces the budget locally.
-                // Hard enforcement in the adapters/proxy is a provider-contract
-                // follow-up, not this increment.
-                extras: serde_json::json!({ "max_tokens": output_allowance }),
+                // Advisory output cap: the smaller of the remaining run budget
+                // and the context window's room after input (the input measured
+                // with the conservative window bound), so a provider that
+                // honours `extras` keeps input+output within both budget and
+                // window. The post-call accounting still enforces the budget
+                // locally; hard enforcement in the adapters/proxy is a
+                // provider-contract follow-up, not this increment.
+                extras: serde_json::json!({
+                    "max_tokens": output_window_cap(window, output_allowance, window_token_estimate(prompt_len))
+                }),
             };
             // Bound the call by the wall-clock budget that remains, so a
             // stalled provider cannot hang the loop (and the daemon) past
@@ -464,28 +504,34 @@ impl<'a> Dispatcher<'a> {
                 Err(e) => {
                     // Feed the parse failure back so the model can correct on
                     // the next step; the step budget bounds repeated failures.
-                    transcript.push(format!(
-                        "step {step}: your response was not a valid step ({e}); reply with exactly one JSON step"
-                    ));
+                    transcript.push(TranscriptEntry::Nag {
+                        step,
+                        detail: format!(
+                            "your response was not a valid step ({e}); reply with exactly one JSON step"
+                        ),
+                    });
                     continue;
                 }
             };
 
             match step_action {
-                AgentStep::Stop { terminal, note } => {
+                AgentStep::Stop { terminal, .. } => {
                     // The model may only stop on a condition the behaviour
                     // declared; an unknown (or injected) terminal is rejected
                     // and fed back for correction rather than ending the loop.
                     if !m.terminal.contains_key(&terminal) {
-                        transcript.push(format!(
-                            "step {step}: \"{terminal}\" is not a declared stop condition; stop only with one of: {}",
-                            m.terminal.keys().cloned().collect::<Vec<_>>().join(", ")
-                        ));
+                        transcript.push(TranscriptEntry::Nag {
+                            step,
+                            detail: format!(
+                                "\"{terminal}\" is not a declared stop condition; stop only with one of: {}",
+                                m.terminal.keys().cloned().collect::<Vec<_>>().join(", ")
+                            ),
+                        });
                         continue;
                     }
-                    if !note.is_empty() {
-                        transcript.push(format!("step {step}: stopped on {terminal} ({note})"));
-                    }
+                    // A stop ends the loop immediately, so the note is not fed
+                    // back into any later step's prompt; the declared terminal
+                    // name below is what the surfacing keys off.
                     // Emit the bare declared terminal name (as a workflow
                     // handler would), so the surfacing disposition can key off
                     // it later.
@@ -519,10 +565,12 @@ impl<'a> Dispatcher<'a> {
                         .await
                     {
                         Ok(receipt) => {
-                            transcript.push(format!(
-                                "step {step}: proposed {} ({}); gate decision: {:?}",
-                                action.tool, action.summary, receipt.decision
-                            ));
+                            transcript.push(TranscriptEntry::Proposed {
+                                step,
+                                tool: action.tool.clone(),
+                                summary: action.summary.clone(),
+                                decision: format!("{:?}", receipt.decision),
+                            });
                             outcomes.push(DispatchOutcome::Decided {
                                 behaviour: behaviour.clone(),
                                 action,
@@ -542,7 +590,10 @@ impl<'a> Dispatcher<'a> {
                         Err(e) => {
                             // Recoverable (e.g. a tool out of scope): record it
                             // and feed it back so the model can choose again.
-                            transcript.push(format!("step {step}: action refused ({e})"));
+                            transcript.push(TranscriptEntry::Refused {
+                                step,
+                                reason: e.to_string(),
+                            });
                             outcomes.push(DispatchOutcome::Refused {
                                 behaviour: behaviour.clone(),
                                 reason: e.to_string(),
@@ -591,6 +642,76 @@ fn reads_satisfied(needs: ReadScope, granted: AccessTier) -> bool {
 fn estimate_tokens(reported: Option<u32>, text_len: usize) -> u32 {
     let estimate = (text_len / 4) as u32;
     reported.map_or(estimate, |r| r.max(estimate))
+}
+
+/// A deliberately conservative upper bound on the token count of `text_len`
+/// bytes for the context-window guard: one byte per token. A token is at least
+/// one byte in any tokenizer, so the real count never exceeds this, which
+/// keeps the window check fail-closed even for token-dense input (where the
+/// 4-bytes-per-token cost estimate would under-count). It over-counts ordinary
+/// English by ~4x, so it errs toward compacting early; a model-accurate
+/// tokenizer (a provider property) replaces it when the provider is wired and
+/// reclaims the full window. Distinct from [`estimate_tokens`], which averages
+/// for cost accounting rather than bounding for safety.
+fn window_token_estimate(text_len: usize) -> u32 {
+    u32::try_from(text_len).unwrap_or(u32::MAX)
+}
+
+/// The advisory output-token cap for a completion: the smaller of what the run
+/// token budget leaves (`budget_allowance`) and what the model's context
+/// `window` leaves after this call's input (`window - input_window_estimate`,
+/// the input measured with the conservative window bound). Bounding by the
+/// window, not just the budget, keeps a large manifest token budget from
+/// requesting more output than the window can hold once the input is counted.
+fn output_window_cap(window: u32, budget_allowance: u32, input_window_estimate: u32) -> u32 {
+    budget_allowance.min(window.saturating_sub(input_window_estimate))
+}
+
+/// The outcome of a compaction pass: either this step's prompt fits the
+/// context window, or it cannot and the loop must terminate closed. Compaction
+/// makes no model call, so it has no provider/timeout/budget failure modes of
+/// its own.
+#[derive(Debug, PartialEq, Eq)]
+enum CompactionOutcome {
+    /// The step prompt fits the window (it always did, or compaction brought it
+    /// under the threshold).
+    Proceed,
+    /// Pruning and tightening could not get the prompt under the window;
+    /// terminate closed (`budget_context`) rather than send it.
+    OverWindow,
+}
+
+/// Keep the loop's working memory inside the model's context `window` before a
+/// step's prompt is built, deterministically and with no model call: estimate
+/// the prompt with the conservative window bound, and if it is over the
+/// window, prune redundant correction feedback, then tighten older proposals
+/// (dropping rationale prose while keeping every tool, decision, and refusal
+/// verbatim). If it still will not fit, report `OverWindow` so the caller
+/// closes the loop rather than sending an over-window prompt or silently
+/// dropping a load-bearing fact. `window` is the wired model's input window
+/// (from the provider), so the bound tracks the real backend.
+fn compact_for_window(
+    behaviour: &Behaviour,
+    event: &AgentEvent,
+    transcript: &mut Vec<TranscriptEntry>,
+    window: u32,
+    policy: &CompactionPolicy,
+) -> CompactionOutcome {
+    let estimate = |t: &[TranscriptEntry]| {
+        window_token_estimate(build_agent_prompt(behaviour, event, t).len())
+    };
+    if !policy.over(window, estimate(transcript)) {
+        return CompactionOutcome::Proceed;
+    }
+    compaction::prune(transcript);
+    if !policy.over(window, estimate(transcript)) {
+        return CompactionOutcome::Proceed;
+    }
+    compaction::tighten(transcript, policy.keep_recent);
+    if !policy.over(window, estimate(transcript)) {
+        return CompactionOutcome::Proceed;
+    }
+    CompactionOutcome::OverWindow
 }
 
 #[cfg(test)]
@@ -971,6 +1092,7 @@ trigger:
         responses: std::sync::Mutex<VecDeque<Result<String, ProviderError>>>,
         tokens_per_call: u32,
         report_usage: bool,
+        context_window: u32,
     }
     impl MockProvider {
         fn new(responses: Vec<Result<String, ProviderError>>) -> Self {
@@ -978,6 +1100,7 @@ trigger:
                 responses: std::sync::Mutex::new(responses.into()),
                 tokens_per_call: 20,
                 report_usage: true,
+                context_window: 8_192,
             }
         }
         /// A provider that omits token usage (`None`), to check the loop's
@@ -992,6 +1115,11 @@ trigger:
         /// post-call accumulation to the budget independent of prompt size.
         fn with_tokens_per_call(mut self, n: u32) -> Self {
             self.tokens_per_call = n;
+            self
+        }
+        /// Report a specific context window, to drive the compaction guard.
+        fn with_context_window(mut self, w: u32) -> Self {
+            self.context_window = w;
             self
         }
     }
@@ -1026,6 +1154,9 @@ trigger:
         }
         fn name(&self) -> &str {
             "mock"
+        }
+        fn context_window(&self) -> u32 {
+            self.context_window
         }
     }
 
@@ -1490,5 +1621,196 @@ trigger:
             &outcomes[0],
             DispatchOutcome::Terminal { outcome, .. } if outcome == "budget_wall_ms"
         ));
+    }
+
+    // --- Context compaction (deterministic, model-free) ---
+
+    /// A demo agent behaviour with a budget generous enough that the token and
+    /// wall bounds never interfere with the compaction logic under test.
+    fn demo_behaviour() -> Behaviour {
+        parse(&agent_skill(20, 100_000_000, 600_000)).expect("valid agent skill")
+    }
+
+    /// The step-prompt token estimate for a transcript, computed with the same
+    /// conservative window bound the loop uses, so a test can place a window
+    /// threshold precisely between two transcript states.
+    fn prompt_estimate(b: &Behaviour, ev: &AgentEvent, t: &[TranscriptEntry]) -> u32 {
+        window_token_estimate(build_agent_prompt(b, ev, t).len())
+    }
+
+    fn proposed(step: u32) -> TranscriptEntry {
+        TranscriptEntry::Proposed {
+            step,
+            tool: "graph.write".to_string(),
+            summary: format!("tag file {step} as part of the active project"),
+            decision: "RequireConfirmation".to_string(),
+        }
+    }
+    fn nag(step: u32) -> TranscriptEntry {
+        TranscriptEntry::Nag {
+            step,
+            detail: "your response was not a valid step (no JSON object); reply with exactly one JSON step".to_string(),
+        }
+    }
+
+    fn compact(
+        b: &Behaviour,
+        ev: &AgentEvent,
+        t: &mut Vec<TranscriptEntry>,
+        window: u32,
+        p: &CompactionPolicy,
+    ) -> CompactionOutcome {
+        compact_for_window(b, ev, t, window, p)
+    }
+
+    #[test]
+    fn compaction_leaves_an_under_threshold_transcript_untouched() {
+        let b = demo_behaviour();
+        let ev = event("~/foo.rs");
+        let mut t = vec![proposed(0), proposed(1)];
+        let before = t.clone();
+        let window = 1_000_000; // far above the prompt
+        let p = CompactionPolicy::default();
+        assert_eq!(compact(&b, &ev, &mut t, window, &p), CompactionOutcome::Proceed);
+        assert_eq!(t, before);
+    }
+
+    #[test]
+    fn cheap_prune_alone_can_bring_it_under() {
+        let b = demo_behaviour();
+        let ev = event("~/foo.rs");
+        let full: Vec<TranscriptEntry> = (0..6).map(nag).collect();
+        let pruned = {
+            let mut t = full.clone();
+            compaction::prune(&mut t);
+            t
+        };
+        let full_est = prompt_estimate(&b, &ev, &full);
+        let pruned_est = prompt_estimate(&b, &ev, &pruned);
+        assert!(pruned_est < full_est, "prune must shrink the prompt");
+        let window = (pruned_est + full_est) / 2;
+        let p = CompactionPolicy {
+            headroom: 0,
+            keep_recent: 4,
+        };
+        let mut t = full.clone();
+        assert_eq!(compact(&b, &ev, &mut t, window, &p), CompactionOutcome::Proceed);
+        assert!(t.len() < full.len()); // the nag run collapsed
+    }
+
+    #[test]
+    fn tighten_brings_a_substantive_transcript_under_and_keeps_facts() {
+        let b = demo_behaviour();
+        let ev = event("~/foo.rs");
+        let full: Vec<TranscriptEntry> = (0..8).map(proposed).collect();
+        let tightened = {
+            let mut t = full.clone();
+            compaction::tighten(&mut t, 2);
+            t
+        };
+        let full_est = prompt_estimate(&b, &ev, &full);
+        let tight_est = prompt_estimate(&b, &ev, &tightened);
+        assert!(tight_est < full_est);
+        // A window the full transcript overflows but the tightened one fits;
+        // prune is a no-op here (no nags), so tighten must do the work.
+        let window = (tight_est + full_est) / 2;
+        let p = CompactionPolicy {
+            headroom: 0,
+            keep_recent: 2,
+        };
+        let mut t = full.clone();
+        assert_eq!(compact(&b, &ev, &mut t, window, &p), CompactionOutcome::Proceed);
+        // The oldest proposal kept its tool and decision; only the rationale
+        // prose was dropped.
+        match &t[0] {
+            TranscriptEntry::Proposed {
+                summary,
+                tool,
+                decision,
+                ..
+            } => {
+                assert!(summary.is_empty());
+                assert_eq!(tool, "graph.write");
+                assert_eq!(decision, "RequireConfirmation");
+            }
+            other => panic!("expected a tightened proposal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn over_window_when_even_tightening_cannot_fit() {
+        let b = demo_behaviour();
+        let ev = event("~/foo.rs");
+        let base = prompt_estimate(&b, &ev, &[]);
+        let full: Vec<TranscriptEntry> = (0..8).map(proposed).collect();
+        // A window below even the empty-transcript prompt: neither prune nor
+        // tighten can help, so the loop must close over-window.
+        let window = base / 2;
+        let p = CompactionPolicy {
+            headroom: 0,
+            keep_recent: 2,
+        };
+        let mut t = full.clone();
+        assert_eq!(compact(&b, &ev, &mut t, window, &p), CompactionOutcome::OverWindow);
+    }
+
+    #[test]
+    fn over_window_when_event_alone_exceeds_the_window() {
+        let b = demo_behaviour();
+        let ev = event("~/foo.rs");
+        let base = prompt_estimate(&b, &ev, &[]);
+        let window = base / 2;
+        let p = CompactionPolicy {
+            headroom: 0,
+            keep_recent: 4,
+        };
+        let mut t: Vec<TranscriptEntry> = Vec::new();
+        assert_eq!(compact(&b, &ev, &mut t, window, &p), CompactionOutcome::OverWindow);
+    }
+
+    #[tokio::test]
+    async fn agent_loop_terminates_budget_context_when_compaction_cannot_fit() {
+        // End-to-end: a behaviour whose event alone overflows the provider's
+        // window. The loop reads the window from the provider, runs compaction
+        // (which cannot help), and closes with budget_context rather than
+        // sending an over-window prompt.
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        // An 8-token window: even the empty-transcript prompt overflows it.
+        let provider = MockProvider::new(vec![propose("graph.write")]).with_context_window(8); // must not be reached
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        );
+
+        let outcomes = d.dispatch(&event(&"x".repeat(10_000))).await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(
+            &outcomes[0],
+            DispatchOutcome::Terminal { outcome, .. } if outcome == "budget_context"
+        ));
+        // Compaction closed the loop before any step call.
+        assert!(audit.recorded().await.is_empty());
+    }
+
+    #[test]
+    fn output_window_cap_keeps_input_plus_output_within_the_window() {
+        let window = 1000;
+        // Window leaves 1000-600=400 after input; budget leaves 800 -> window-bound.
+        assert_eq!(output_window_cap(window, 800, 600), 400);
+        assert!(600 + output_window_cap(window, 800, 600) <= window);
+        // Budget is the tighter bound here.
+        assert_eq!(output_window_cap(window, 100, 600), 100);
+        // Input alone fills the window: no output room.
+        assert_eq!(output_window_cap(window, 800, 1200), 0);
     }
 }
