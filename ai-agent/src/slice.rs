@@ -185,9 +185,11 @@ pub struct StaticMountPolicy {
 
 impl StaticMountPolicy {
     /// A policy with no read-only mounts (every canonical-absolute path is
-    /// writable).
-    pub fn empty() -> Self {
-        Self::default()
+    /// writable). `const` so it can back a `static` test seam.
+    pub const fn empty() -> Self {
+        Self {
+            prefixes: BTreeSet::new(),
+        }
     }
 
     /// A policy from an explicit set of read-only prefixes.
@@ -235,6 +237,12 @@ pub enum SliceError {
     /// filesystem path (a `NotReadOnly` operand). A parameter cannot be both.
     #[error("binding {0:?} is used both as a node and as a path")]
     ContradictoryBinding(String),
+    /// The invocation supplied an operand the schema does not reference. A
+    /// prediction must prove exactly the operands the action will use, so an
+    /// extra operand (which the schema never constrains) is refused rather
+    /// than allowed to ride along on a proof that ignored it.
+    #[error("operand {0:?} is not a parameter of the action's schema")]
+    UnexpectedOperand(String),
     /// A graph result did not have the expected shape (e.g. an edge-count
     /// query returned other than a single numeric `cnt`), so it cannot be
     /// trusted to mean "absent".
@@ -633,6 +641,16 @@ async fn build_slice(
     // an effect that asserts an impossible relationship or field is refused
     // rather than predicted Valid on a post-state the graph could never hold.
     validate_against_kg(schema, &spec.labels)?;
+    // Every operand must be a parameter the schema references. The schema
+    // constrains only the operands it names, so an extra one would ride along
+    // on a prediction that ignored it; refuse it rather than prove a partial
+    // operand set for an action that will execute with more.
+    if let Some(extra) = bindings
+        .keys()
+        .find(|k| !spec.node_binds.contains(*k) && !spec.path_bindings.contains(*k))
+    {
+        return Err(SliceError::UnexpectedOperand(extra.clone()));
+    }
     let mut state = WorldState::new();
     let mut loaded: BTreeSet<String> = BTreeSet::new();
 

@@ -25,6 +25,7 @@ use lunaris_ai_agent::behaviour::BehaviourKind;
 use lunaris_ai_agent::config::AgentConfig;
 use lunaris_ai_agent::engine::{DispatchOutcome, Dispatcher};
 use lunaris_ai_agent::gate::Gate;
+use lunaris_ai_agent::slice::{FsPathResolver, ProcMountsPolicy};
 use lunaris_ai_agent::graph::{UnixGraph, DEFAULT_GRAPH_SOCKET};
 use lunaris_ai_agent::handlers::builtin_handlers;
 use lunaris_ai_agent::loader::{load, BehaviourSource};
@@ -146,7 +147,12 @@ async fn run(
 
         let read_tier = config.read_tier;
         let capability = Capability::new(read_tier, config.actions);
-        let gate = Gate::new(&capability, audit, observer);
+        // The world-model seams the gate's predict-before-act step reads
+        // through: the same graph the handlers use, plus the production path
+        // and read-only mount resolvers.
+        let paths = FsPathResolver;
+        let mounts = ProcMountsPolicy;
+        let gate = Gate::new(&capability, audit, observer, &paths, &mounts);
         let clock = SystemClock;
         // `read_tier` gates which behaviours may read at all: the dispatcher
         // denies the graph to any behaviour whose declared `reads` exceeds it.

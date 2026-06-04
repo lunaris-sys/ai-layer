@@ -45,22 +45,77 @@
 //! (delete / send / install / sudo / exec / config-write). It cannot judge
 //! *argument-dependent* destructiveness — e.g. an `fs.move` is reversible
 //! unless its destination is occupied, in which case it is an irreversible
-//! overwrite (design-doc gap F4). That reversibility judgment belongs to
-//! the **B2 world-model action schema** (preconditions + effects), not to
-//! a name heuristic. Until it lands, this gate enforces a conservative
-//! guard: it **caps any executing decision (PreviewThenExecute / Proceed)
-//! to explicit confirmation**, so no action auto-executes while its
-//! argument-level safety is unprovable. Suggest/Propose is unaffected (the
-//! user executes manually). B2 replaces the blanket cap with per-action
-//! argument + reversibility validation against the declared scope values.
+//! overwrite (design-doc gap F4). That judgment belongs to the **world-model
+//! action schema** (preconditions + effects), not a name heuristic.
+//!
+//! So before an executing decision (PreviewThenExecute / Proceed) is allowed
+//! through, the gate runs a **predict-before-act** step: it resolves the
+//! action's trusted, registry-resolved schema, builds a bounded graph slice
+//! (through the behaviour-scoped graph handle, so the proof never reads more
+//! than the behaviour may) for the invocation's operands, and asks the
+//! world-model interpreter whether the preconditions hold and the effects
+//! apply cleanly. A `Valid` prediction lifts the conservative cap; otherwise
+//! (no registered rule, an unprovable invocation, or any failure or timeout)
+//! the executing decision is downgraded to explicit confirmation, so nothing
+//! auto-executes whose argument-level safety is unproven. Suggest/Propose is
+//! unaffected (the user executes manually). The prediction comes only from the
+//! trusted world model, never the proposal, and the lifted-or-capped decision
+//! is what the audit records.
+//!
+//! The lift is deliberately conservative: a proven action is lifted only to a
+//! **previewed execution (PreviewThenExecute), never silent autonomous
+//! Proceed**. Two boundaries that safe auto-execution needs are not yet in
+//! place: the proof is a point-in-time slice (the graph exposes no
+//! snapshot/version), so an executor must atomically re-check the
+//! preconditions at write time (gap A2), and the per-app grant consulted is
+//! the agent's own (the acting app), a coarse model a finer per-target grant
+//! will refine. The human-visible preview is the bridge until those land;
+//! nothing executes today (there is no executor), so the lifted decision is
+//! the authorization the executor will later honour, not an execution.
+//!
+//! ## Executor obligations (the contract a lifted decision carries)
+//!
+//! The design (ground truth) deliberately separates this gate's *lift* (the
+//! authorization) from the executor's *enforcement*. Before acting on a lifted
+//! `PreviewThenExecute`, the executor (a later increment) must:
+//! 1. **Execute exactly the proven effect**, the schema effect for the proven
+//!    operands (e.g. the `FILE_PART_OF` `AssertEdge`), never a free-form
+//!    re-interpretation of the tool name (else a different mutation rides on
+//!    the proof).
+//! 2. **Atomically re-check the preconditions at write time** (gap A2): the
+//!    proof is a point-in-time slice and the graph exposes no snapshot, so a
+//!    just-read absence can go stale; the write must be conditional on the
+//!    preconditions still holding, and idempotent.
+//! 3. **Enforce the manifest's per-tool scope *values*** (e.g. `graph.write`
+//!    restricted to certain projects) and **resolve the real per-target/app
+//!    binding**, refining today's coarse agent-grant model.
+//!
+//! Until all three exist, the cap holds beyond preview and nothing
+//! auto-executes; these are not this increment's to build.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use lunaris_ai_core::audit::{behaviour_action_event, AuditSink};
 use lunaris_ai_core::capability::{ActionDecision, ActionKind, BaselineMode, Capability};
 use lunaris_ai_core::mcp::{AlwaysConfirm, AlwaysConfirmReason};
 
-use crate::seams::GateObserver;
+use crate::registry;
+use crate::seams::{GateObserver, GraphHandle};
+use crate::slice::{build_slice_trusted, MountPolicy, PathResolver};
+use crate::world::{self, EvalContext};
+
+/// How long the predict-before-act proof may run before it is treated as
+/// unproven (so the conservative cap stands). It reads the graph and the
+/// filesystem; a stalled dependency must not park the gate.
+///
+/// This bounds the async work (the graph round trips). It cannot interrupt a
+/// *blocking* filesystem call mid-syscall (the production path/mount resolvers
+/// use `std::fs`), so a hung FUSE/NFS mount could still park the worker past
+/// the deadline. Making the path/mount seams async (resolving on a blocking
+/// pool) so the deadline bounds them too is a follow-up; the common stall (a
+/// slow knowledge socket) is async and is bounded here today.
+const PROOF_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// An action a behaviour proposes. Carries only what a proposer may
 /// legitimately state — the tool/operation it wants to invoke, a
@@ -135,13 +190,18 @@ pub enum GateError {
     },
 }
 
-/// The action gate, holding the long-lived collaborators (the capability,
-/// the audit sink, and the observer seam). The engine constructs one and
-/// calls [`Gate::decide_action`] per proposed action.
+/// The action gate, holding the long-lived collaborators: the capability, the
+/// audit sink, the observer seam, and the system path/mount resolvers the
+/// predict-before-act step reads through. The graph is *not* held here: it is
+/// passed per call to [`Gate::decide_action`] as the behaviour-scoped handle
+/// the dispatcher chose (a denying handle for a `reads: minimal` behaviour),
+/// so the proof can never read more of the graph than the behaviour may.
 pub struct Gate<'a> {
     capability: &'a Capability,
     audit: &'a dyn AuditSink,
     observer: &'a dyn GateObserver,
+    paths: &'a dyn PathResolver,
+    mounts: &'a dyn MountPolicy,
 }
 
 impl<'a> Gate<'a> {
@@ -150,11 +210,15 @@ impl<'a> Gate<'a> {
         capability: &'a Capability,
         audit: &'a dyn AuditSink,
         observer: &'a dyn GateObserver,
+        paths: &'a dyn PathResolver,
+        mounts: &'a dyn MountPolicy,
     ) -> Self {
         Self {
             capability,
             audit,
             observer,
+            paths,
+            mounts,
         }
     }
 
@@ -173,6 +237,7 @@ impl<'a> Gate<'a> {
         tools: &BTreeMap<String, Vec<String>>,
         action: &ProposedAction,
         ctx: &ActionContext<'_>,
+        graph: &dyn GraphHandle,
     ) -> Result<GateReceipt, GateError> {
         // Tool-scope enforcement: a behaviour may only act through a tool
         // it declared. An out-of-scope proposal is refused fail-closed and
@@ -203,17 +268,50 @@ impl<'a> Gate<'a> {
             self.capability
                 .decide_for_behaviour(ctx.app_id, kind, ctx.external_trigger, ceiling);
 
-        // B1 conservative execution guard. Without structured action
-        // arguments and the world-model action schema (B2), the gate cannot
-        // prove a state-changing action is within its declared scope values
-        // and reversible, so it must not authorise *autonomous* execution.
-        // Any executing decision is capped to explicit confirmation;
-        // Suggest/Propose is unaffected, because there the user executes
-        // manually (the human is the check). B2 replaces this blanket cap
-        // with per-action argument + reversibility validation.
+        // Predict-before-act. An executing decision (PreviewThenExecute /
+        // Proceed) is only authorised autonomously if the world model proves
+        // *this* invocation safe: its trusted, registry-resolved schema holds
+        // against the action's operands and a bounded graph slice. A `Valid`
+        // prediction lifts the conservative cap to the capability's real
+        // decision; no rule, an unprovable invocation, or any failure keeps
+        // the cap (downgrade to explicit confirmation). Suggest/Propose is
+        // unaffected (there the user executes manually). The proof runs only
+        // for an executing decision (the cap would not change the others), and
+        // the lifted decision is what the audit below records.
+        // The proof reads the graph and the filesystem, so bound it: a stalled
+        // knowledge socket or a slow path lookup must fail closed (unproven,
+        // so the cap stands) rather than park the gate and stall later
+        // dispatch. A timeout is treated exactly like an unprovable action.
+        let proven = if matches!(
+            decision,
+            ActionDecision::PreviewThenExecute | ActionDecision::Proceed
+        ) {
+            tokio::time::timeout(PROOF_TIMEOUT, self.prove_action(action, kind, ctx, ceiling, graph))
+                .await
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
         let decision = match decision {
+            // A proven executing action is lifted, but only to a *previewed*
+            // execution, never silent autonomous `Proceed`. Two boundaries are
+            // not yet in place that full auto-execution would need, so the
+            // human-visible preview is the bridge: (1) the proof is a
+            // point-in-time slice (the graph has no snapshot/version, gap A2),
+            // so the executor that eventually acts on a lifted decision must
+            // re-check the preconditions atomically at write time; (2) the
+            // per-app grant consulted is the *agent's own* (the acting app),
+            // the current coarse model, so a finer per-target/per-behaviour
+            // grant is future work. Capping at preview keeps a human in the
+            // loop until those land. Nothing executes today (there is no
+            // executor); this is the authorization the executor will honour.
             ActionDecision::PreviewThenExecute | ActionDecision::Proceed => {
-                ActionDecision::RequireConfirmation
+                if proven {
+                    ActionDecision::PreviewThenExecute
+                } else {
+                    ActionDecision::RequireConfirmation
+                }
             }
             keep @ (ActionDecision::Propose | ActionDecision::RequireConfirmation) => keep,
         };
@@ -236,6 +334,65 @@ impl<'a> Gate<'a> {
             decision,
             audit_index,
         })
+    }
+
+    /// Whether the world model proves this invocation safe: its trusted,
+    /// registry-resolved schema's preconditions hold and its effects apply
+    /// cleanly over a bounded graph slice for the action's operands. Fails
+    /// closed (returns `false`) on no registered rule, any slice-build failure
+    /// (an unreachable graph, a malformed result, an unresolved path, an
+    /// operand the schema does not name), or a prediction that is not `Valid`.
+    /// A `false` here is not a refusal, it just means the conservative cap
+    /// stands.
+    ///
+    /// The proof binds the trusted schema (resolved by the tool id) and the
+    /// invocation's exact operands to a specific effect (e.g. the schema's
+    /// `AssertEdge`). The executor that eventually acts on a lifted decision
+    /// must execute *that proven effect* with *those operands*, not a free-form
+    /// re-interpretation of the tool name, or a different mutation could ride
+    /// on the proof. That obligation, with the atomic precondition re-check, is
+    /// the executor's (it does not exist yet).
+    async fn prove_action(
+        &self,
+        action: &ProposedAction,
+        kind: ActionKind,
+        ctx: &ActionContext<'_>,
+        ceiling: BaselineMode,
+        graph: &dyn GraphHandle,
+    ) -> bool {
+        // The schema must come from the trusted registry, never the proposal;
+        // with no registered rule the action cannot be proven.
+        let Some(trusted) = registry::lookup(&action.tool) else {
+            return false;
+        };
+        // Build the bounded slice for this invocation's operands, reading
+        // through the behaviour-scoped `graph` the caller passed (a denying
+        // handle for a `reads: minimal` behaviour, so the proof cannot read
+        // more than the behaviour may). `arguments` is the (untrusted) operand
+        // set; the schema and the slice are what make a `Valid` prediction
+        // trustworthy. Any build failure fails closed.
+        let (state, bindings) = match build_slice_trusted(
+            &trusted,
+            &action.tool,
+            &action.arguments,
+            graph,
+            self.paths,
+            self.mounts,
+        )
+        .await
+        {
+            Ok(slice) => slice,
+            Err(_) => return false,
+        };
+        let eval = EvalContext {
+            capability: self.capability,
+            action_id: &action.tool,
+            app_id: ctx.app_id,
+            action_kind: kind,
+            external_trigger: ctx.external_trigger,
+            ceiling,
+        };
+        world::predict(trusted.schema(), &bindings, &state, &eval).is_valid()
     }
 }
 
@@ -274,8 +431,13 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    use std::collections::HashMap;
+
     use audit_proto::MockAuditSink;
     use lunaris_ai_core::capability::{AccessTier, ActionPermissions};
+
+    use crate::seams::{DeniedGraph, GraphError};
+    use crate::slice::{FsPathResolver, SliceError, StaticMountPolicy};
 
     // A recording observer doubles as the GateObserver test double.
     #[derive(Default)]
@@ -318,13 +480,14 @@ mod tests {
         let audit = MockAuditSink::accepting();
         let obs = Recorder::default();
 
-        let receipt = Gate::new(&cap, &audit, &obs)
+        let receipt = Gate::new(&cap, &audit, &obs, &FsPathResolver, &StaticMountPolicy::empty())
             .decide_action(
                 "auto-tag-by-project",
                 BaselineMode::Suggest,
                 &scope(&["graph.write"]),
                 &action(),
                 &ctx(false, "run-1"),
+                &DeniedGraph,
             )
             .await
             .expect("accepting sink");
@@ -357,13 +520,14 @@ mod tests {
                 summary: "x".to_string(),
                 arguments: BTreeMap::new(),
             };
-            let receipt = Gate::new(&cap, &audit, &obs)
+            let receipt = Gate::new(&cap, &audit, &obs, &FsPathResolver, &StaticMountPolicy::empty())
                 .decide_action(
                     "tidy-downloads",
                     BaselineMode::Supervised,
                     &scope(&[tool]),
                     &act,
                     &ctx(false, "run-x"),
+                    &DeniedGraph,
                 )
                 .await
                 .unwrap();
@@ -386,13 +550,14 @@ mod tests {
         );
         let audit = MockAuditSink::accepting();
         let obs = Recorder::default();
-        let receipt = Gate::new(&cap, &audit, &obs)
+        let receipt = Gate::new(&cap, &audit, &obs, &FsPathResolver, &StaticMountPolicy::empty())
             .decide_action(
                 "tidy-downloads",
                 BaselineMode::Supervised,
                 &scope(&["graph.write"]),
                 &action(),
                 &ctx(true, "run-2"), // external trigger
+                &DeniedGraph,
             )
             .await
             .unwrap();
@@ -409,13 +574,14 @@ mod tests {
         let audit = MockAuditSink::failing();
         let obs = Recorder::default();
 
-        let err = Gate::new(&cap, &audit, &obs)
+        let err = Gate::new(&cap, &audit, &obs, &FsPathResolver, &StaticMountPolicy::empty())
             .decide_action(
                 "auto-tag-by-project",
                 BaselineMode::Suggest,
                 &scope(&["graph.write"]),
                 &action(),
                 &ctx(false, "run-3"),
+                &DeniedGraph,
             )
             .await
             .expect_err("failing audit must refuse the action");
@@ -436,13 +602,212 @@ mod tests {
         );
         let audit = MockAuditSink::accepting();
         let obs = Recorder::default();
-        let receipt = Gate::new(&cap, &audit, &obs)
+        let receipt = Gate::new(&cap, &audit, &obs, &FsPathResolver, &StaticMountPolicy::empty())
             .decide_action(
                 "auto-tag-by-project",
                 BaselineMode::Supervised,
                 &scope(&["graph.write"]),
                 &action(),
                 &ctx(false, "run-5"),
+                &DeniedGraph,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.decision, ActionDecision::RequireConfirmation);
+    }
+
+    // --- predict-before-act: a Valid prediction lifts the conservative cap ---
+
+    /// A graph returning canned rows when the query contains a needle.
+    struct MockGraph(Vec<(&'static str, Vec<HashMap<String, serde_json::Value>>)>);
+
+    #[async_trait::async_trait]
+    impl GraphHandle for MockGraph {
+        async fn query(
+            &self,
+            cypher: &str,
+        ) -> Result<Vec<HashMap<String, serde_json::Value>>, GraphError> {
+            for (needle, rows) in &self.0 {
+                if cypher.contains(needle) {
+                    return Ok(rows.clone());
+                }
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    /// A resolver that accepts an already-canonical absolute path as itself.
+    struct IdentityResolver;
+    impl PathResolver for IdentityResolver {
+        fn resolve(&self, raw: &str) -> Result<String, SliceError> {
+            if raw.starts_with('/') {
+                Ok(raw.to_string())
+            } else {
+                Err(SliceError::PathResolve {
+                    raw: raw.to_string(),
+                    reason: "not absolute".to_string(),
+                })
+            }
+        }
+    }
+
+    fn row(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    /// The graph for tagging `/proj/a.rs` (under `/proj`) to project `p1`,
+    /// with the `FILE_PART_OF` edge present or not.
+    fn tag_graph(linked: bool) -> MockGraph {
+        MockGraph(vec![
+            (
+                "n:File {id: '/proj/a.rs'}",
+                vec![row(&[("id", "/proj/a.rs".into()), ("path", "/proj/a.rs".into())])],
+            ),
+            (
+                "n:Project {id: 'p1'}",
+                vec![row(&[("id", "p1".into()), ("root_path", "/proj".into())])],
+            ),
+            (
+                "count(*) AS cnt",
+                vec![row(&[("cnt", serde_json::Value::from(i64::from(linked)))])],
+            ),
+        ])
+    }
+
+    fn graph_write_action() -> ProposedAction {
+        ProposedAction {
+            tool: "graph.write".to_string(),
+            summary: "tag /proj/a.rs as part of p1".to_string(),
+            arguments: BTreeMap::from([
+                ("file".to_string(), "/proj/a.rs".to_string()),
+                ("project".to_string(), "p1".to_string()),
+            ]),
+        }
+    }
+
+    /// The autonomy capability that resolves an ordinary Supervised-ceiling
+    /// action to `PreviewThenExecute` (as in `b1_caps_...`).
+    fn executing_cap() -> Capability {
+        Capability::new(
+            AccessTier::Full,
+            ActionPermissions::new(BaselineMode::Suggest, ["org.lunaris.files"]),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_valid_prediction_lifts_the_cap() {
+        let cap = executing_cap();
+        let audit = MockAuditSink::accepting();
+        let obs = Recorder::default();
+        // The file lies under the project root and is not yet linked.
+        let graph = tag_graph(false);
+        let receipt = Gate::new(&cap, &audit, &obs, &IdentityResolver, &StaticMountPolicy::empty())
+            .decide_action(
+                "auto-tag-by-project",
+                BaselineMode::Supervised,
+                &scope(&["graph.write"]),
+                &graph_write_action(),
+                &ctx(false, "run-lift"),
+                &graph,
+            )
+            .await
+            .unwrap();
+        // The world model proved the link safe, so the capability's executing
+        // decision stands instead of being capped to confirmation.
+        assert_eq!(receipt.decision, ActionDecision::PreviewThenExecute);
+        assert_eq!(obs.0.lock().unwrap().as_slice(), &[ActionDecision::PreviewThenExecute]);
+    }
+
+    #[tokio::test]
+    async fn an_unprovable_action_keeps_the_cap() {
+        let cap = executing_cap();
+        let audit = MockAuditSink::accepting();
+        let obs = Recorder::default();
+        // The same action, but the edge already exists: `Not(EdgeExists)`
+        // fails, so the prediction is not Valid and the cap stands.
+        let graph = tag_graph(true);
+        let receipt = Gate::new(&cap, &audit, &obs, &IdentityResolver, &StaticMountPolicy::empty())
+            .decide_action(
+                "auto-tag-by-project",
+                BaselineMode::Supervised,
+                &scope(&["graph.write"]),
+                &graph_write_action(),
+                &ctx(false, "run-cap"),
+                &graph,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.decision, ActionDecision::RequireConfirmation);
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_tool_keeps_the_cap() {
+        // A tool with no registry rule cannot be proven, so even an executing
+        // capability decision is capped.
+        let cap = executing_cap();
+        let audit = MockAuditSink::accepting();
+        let obs = Recorder::default();
+        let action = ProposedAction {
+            tool: "graph.query".to_string(),
+            summary: "x".to_string(),
+            arguments: BTreeMap::new(),
+        };
+        let receipt = Gate::new(&cap, &audit, &obs, &FsPathResolver, &StaticMountPolicy::empty())
+            .decide_action(
+                "auto-tag-by-project",
+                BaselineMode::Supervised,
+                &scope(&["graph.query"]),
+                &action,
+                &ctx(false, "run-unreg"),
+                &DeniedGraph,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.decision, ActionDecision::RequireConfirmation);
+    }
+
+    #[tokio::test]
+    async fn an_extra_operand_cannot_ride_on_the_proof() {
+        // The action carries an operand the schema does not name. The proof
+        // must not pass (the extra operand was never constrained), so the cap
+        // stands rather than authorising an under-specified invocation.
+        let cap = executing_cap();
+        let audit = MockAuditSink::accepting();
+        let obs = Recorder::default();
+        let graph = tag_graph(false);
+        let mut action = graph_write_action();
+        action.arguments.insert("rogue".to_string(), "/etc/shadow".to_string());
+        let receipt = Gate::new(&cap, &audit, &obs, &IdentityResolver, &StaticMountPolicy::empty())
+            .decide_action(
+                "auto-tag-by-project",
+                BaselineMode::Supervised,
+                &scope(&["graph.write"]),
+                &action,
+                &ctx(false, "run-extra"),
+                &graph,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.decision, ActionDecision::RequireConfirmation);
+    }
+
+    #[tokio::test]
+    async fn a_denied_graph_cannot_prove_so_the_cap_stands() {
+        // The dispatcher hands a `reads: minimal` behaviour a denying graph
+        // handle. The proof reads through that same handle, so even a
+        // graph.write with real operands cannot be proven and the cap stands:
+        // the proof path is not a read-scope side channel.
+        let cap = executing_cap();
+        let audit = MockAuditSink::accepting();
+        let obs = Recorder::default();
+        let receipt = Gate::new(&cap, &audit, &obs, &IdentityResolver, &StaticMountPolicy::empty())
+            .decide_action(
+                "auto-tag-by-project",
+                BaselineMode::Supervised,
+                &scope(&["graph.write"]),
+                &graph_write_action(),
+                &ctx(false, "run-denied"),
+                &DeniedGraph,
             )
             .await
             .unwrap();
@@ -455,13 +820,14 @@ mod tests {
         let audit = MockAuditSink::accepting();
         let obs = Recorder::default();
         // The behaviour declared only graph.query, but proposes graph.write.
-        let err = Gate::new(&cap, &audit, &obs)
+        let err = Gate::new(&cap, &audit, &obs, &FsPathResolver, &StaticMountPolicy::empty())
             .decide_action(
                 "auto-tag-by-project",
                 BaselineMode::Suggest,
                 &scope(&["graph.query"]),
                 &action(),
                 &ctx(false, "run-4"),
+                &DeniedGraph,
             )
             .await
             .expect_err("an out-of-scope tool must be refused");
