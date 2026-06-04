@@ -18,5 +18,6 @@ pub mod handlers;
 pub mod loader;
 pub mod router;
 pub mod seams;
+pub mod slice;
 pub mod source;
 pub mod world;
