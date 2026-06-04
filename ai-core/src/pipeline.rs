@@ -250,8 +250,9 @@ impl QueryRunner for CypherPipeline {
 ///
 /// Models commonly wrap JSON in Markdown fences or surrounding prose;
 /// this finds the first `{` and the matching `}`, ignoring braces
-/// inside string literals.
-fn extract_json(text: &str) -> Option<&str> {
+/// inside string literals. Shared with the agent loop, which parses a
+/// structured step out of the same kind of free-text model output.
+pub fn extract_json(text: &str) -> Option<&str> {
     let bytes = text.as_bytes();
     let start = bytes.iter().position(|&b| b == b'{')?;
     let mut depth = 0i32;

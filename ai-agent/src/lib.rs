@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod agentic;
 pub mod behaviour;
 pub mod config;
 pub mod engine;

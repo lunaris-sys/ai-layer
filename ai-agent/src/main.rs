@@ -21,16 +21,18 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
+use lunaris_ai_agent::behaviour::BehaviourKind;
 use lunaris_ai_agent::config::AgentConfig;
 use lunaris_ai_agent::engine::{DispatchOutcome, Dispatcher};
 use lunaris_ai_agent::gate::Gate;
 use lunaris_ai_agent::graph::{UnixGraph, DEFAULT_GRAPH_SOCKET};
 use lunaris_ai_agent::handlers::builtin_handlers;
 use lunaris_ai_agent::loader::{load, BehaviourSource};
-use lunaris_ai_agent::seams::{NullObserver, TriggerSource};
+use lunaris_ai_agent::seams::{NullObserver, SystemClock, TriggerSource};
 use lunaris_ai_agent::source::{subscription_types, EventBusSource, DEFAULT_CONSUMER_SOCKET};
 use lunaris_ai_core::audit::LedgerAuditSink;
 use lunaris_ai_core::capability::Capability;
+use lunaris_ai_core::provider::AIProvider;
 use os_sdk::config::{Config, ConfigWatcher};
 
 /// Backoff bounds for the initial Event Bus subscription retry.
@@ -110,25 +112,42 @@ async fn run(
             tracing::warn!(error = %err, "behaviour failed to load");
         }
 
-        // Foundation §5.5: with nothing enabled the daemon has no reason to
-        // run. Exit cleanly (the supervisor restarts it when the user enables
-        // a behaviour); this also covers a removed config, which reloads to
-        // the safe empty defaults.
-        let enabled = outcome
-            .loaded
-            .iter()
-            .filter(|b| b.status.is_enabled())
-            .count();
-        if enabled == 0 {
-            tracing::info!("no behaviours enabled; the agent has nothing to do, exiting");
+        // No LLM provider is wired yet: a `kind: agent` behaviour needs one
+        // (routed through ai-proxy) and lands with the first agent behaviour.
+        // A `kind: agent` behaviour therefore cannot run, so it is excluded
+        // from the runnable set below (and logged), not silently kept alive.
+        let provider: Option<&dyn AIProvider> = None;
+
+        // Foundation §5.5: with nothing *runnable* the daemon has no reason to
+        // run. A behaviour is runnable when enabled and either a workflow or
+        // (for an agent) backed by a configured provider. Exit cleanly
+        // otherwise (the supervisor restarts it when a runnable behaviour is
+        // enabled); this also covers a removed config.
+        let mut runnable = 0usize;
+        for b in &outcome.loaded {
+            if !b.status.is_enabled() {
+                continue;
+            }
+            if provider.is_none() && b.behaviour.manifest.kind == BehaviourKind::Agent {
+                tracing::warn!(
+                    behaviour = %b.behaviour.manifest.name,
+                    "agent behaviour is enabled but no AI provider is configured; it will not run"
+                );
+                continue;
+            }
+            runnable += 1;
+        }
+        if runnable == 0 {
+            tracing::info!("no runnable behaviours; the agent has nothing to do, exiting");
             return Ok(());
         }
 
-        tracing::info!(enabled, "starting agent");
+        tracing::info!(runnable, "starting agent");
 
         let read_tier = config.read_tier;
         let capability = Capability::new(read_tier, config.actions);
         let gate = Gate::new(&capability, audit, observer);
+        let clock = SystemClock;
         // `read_tier` gates which behaviours may read at all: the dispatcher
         // denies the graph to any behaviour whose declared `reads` exceeds it.
         // It does NOT yet constrain the *content* of an allowed behaviour's
@@ -141,7 +160,8 @@ async fn run(
         // compromised handler (it could reach the knowledge socket directly),
         // and B1 behaviours are trusted first-party built-ins, so the coarse
         // gate is the boundary today.
-        let dispatcher = Dispatcher::new(&outcome.loaded, handlers, graph, read_tier, gate);
+        let dispatcher =
+            Dispatcher::new(&outcome.loaded, handlers, graph, read_tier, gate, provider, &clock);
 
         // Subscribe to exactly the event types the enabled behaviours need.
         let types = subscription_types(&outcome.loaded);
