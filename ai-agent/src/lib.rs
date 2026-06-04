@@ -19,3 +19,4 @@ pub mod loader;
 pub mod router;
 pub mod seams;
 pub mod source;
+pub mod world;
