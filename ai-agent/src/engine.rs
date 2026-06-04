@@ -494,7 +494,15 @@ impl<'a> Dispatcher<'a> {
                         external_trigger: event.external_content,
                         correlation_id: &correlation_id,
                     };
-                    let action = ProposedAction { tool, summary };
+                    // The model does not yet propose structured operands, so a
+                    // loop-proposed action carries none and can only be
+                    // suggested, never proven for an execution-cap lift. Typed
+                    // model operands land with the real agent behaviour.
+                    let action = ProposedAction {
+                        tool,
+                        summary,
+                        arguments: Default::default(),
+                    };
                     match self
                         .gate
                         .decide_action(&behaviour, m.mode, &m.tools, &action, &ctx)
@@ -649,6 +657,7 @@ tools:
             Ok(HandlerOutcome::Propose(ProposedAction {
                 tool: "graph.write".to_string(),
                 summary: "tag the opened file".to_string(),
+                arguments: Default::default(),
             }))
         }
     }
@@ -713,6 +722,7 @@ tools:
                 action: ProposedAction {
                     tool: "graph.write".to_string(),
                     summary: "tag the opened file".to_string(),
+                    arguments: Default::default(),
                 },
                 decision: ActionDecision::Propose,
                 audit_index: 0,
@@ -840,6 +850,7 @@ tools:
                 action: ProposedAction {
                     tool: "graph.write".to_string(),
                     summary: "tag the opened file".to_string(),
+                    arguments: Default::default(),
                 },
                 decision: ActionDecision::RequireConfirmation,
                 audit_index: 0,

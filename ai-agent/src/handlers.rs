@@ -1,5 +1,7 @@
 //! Built-in workflow handlers (the code behind `kind: workflow` behaviours).
 
+use std::collections::BTreeMap;
+
 use crate::engine::{HandlerError, HandlerOutcome, HandlerRegistry, WorkflowHandler};
 use crate::gate::ProposedAction;
 use crate::seams::{AgentEvent, GraphHandle};
@@ -57,14 +59,33 @@ impl WorkflowHandler for AutoTagByProject {
         };
         matches.retain(|(len, _)| *len == max_len);
 
-        match matches.as_slice() {
-            [(_, id)] => Ok(HandlerOutcome::Propose(ProposedAction {
-                tool: "graph.write".to_string(),
-                summary: format!("Tag {path} as part of project {id}"),
-            })),
+        let project_id = match matches.as_slice() {
+            [(_, id)] => *id,
             // Equally-specific candidates: ambiguous, do not guess (G2).
-            _ => Ok(HandlerOutcome::Terminal("ambiguous_project".to_string())),
-        }
+            _ => return Ok(HandlerOutcome::Terminal("ambiguous_project".to_string())),
+        };
+
+        // Propose optimistically; do not read the File node here. `file.opened`
+        // is consumed from the Event Bus directly, while the File node is
+        // created later by the knowledge promotion pass, so at this point the
+        // node may not exist yet, and a handler-side read would either race or
+        // permanently miss the file. Validating the File node exists, the file
+        // lies under the project root, and no `FILE_PART_OF` edge is already
+        // present is the predict-before-act step's job, where it can fail
+        // closed at decision time. That step is the next increment; until it is
+        // wired, the gate's conservative cap holds, so these operands are
+        // carried for it but never lift an execution gate on their own. The
+        // `file` operand is the path, which is the File node id by the daemon's
+        // keying convention (knowledge `promotion.rs` creates File nodes with
+        // `id = path`).
+        Ok(HandlerOutcome::Propose(ProposedAction {
+            tool: "graph.write".to_string(),
+            summary: format!("Tag {path} as part of project {project_id}"),
+            arguments: BTreeMap::from([
+                ("file".to_string(), path.clone()),
+                ("project".to_string(), project_id.to_string()),
+            ]),
+        }))
     }
 }
 
@@ -86,22 +107,28 @@ mod tests {
 
     use crate::seams::GraphError;
 
-    /// A graph returning canned project rows (or an error).
-    struct FakeGraph(Result<Vec<HashMap<String, serde_json::Value>>, ()>);
+    /// A graph returning canned project rows (or an error). The handler reads
+    /// only the project list; the File node and its links are validated later
+    /// by the predict-before-act step, not here.
+    struct Graph {
+        projects: Vec<HashMap<String, serde_json::Value>>,
+        err: bool,
+    }
 
     #[async_trait::async_trait]
-    impl GraphHandle for FakeGraph {
+    impl GraphHandle for Graph {
         async fn query(
             &self,
             _cypher: &str,
         ) -> Result<Vec<HashMap<String, serde_json::Value>>, GraphError> {
-            self.0
-                .clone()
-                .map_err(|_| GraphError::Failed("boom".to_string()))
+            if self.err {
+                return Err(GraphError::Failed("boom".to_string()));
+            }
+            Ok(self.projects.clone())
         }
     }
 
-    fn projects(pairs: &[(&str, &str)]) -> FakeGraph {
+    fn projects(pairs: &[(&str, &str)]) -> Graph {
         let rows = pairs
             .iter()
             .map(|(id, root)| {
@@ -111,7 +138,10 @@ mod tests {
                 ])
             })
             .collect();
-        FakeGraph(Ok(rows))
+        Graph {
+            projects: rows,
+            err: false,
+        }
     }
 
     fn opened(path: &str) -> AgentEvent {
@@ -123,9 +153,12 @@ mod tests {
         }
     }
 
-    async fn run(graph: &FakeGraph, path: &str) -> HandlerOutcome {
+    async fn run(graph: &Graph, path: &str) -> HandlerOutcome {
         AutoTagByProject.run(&opened(path), graph).await.unwrap()
     }
+
+    const LUNARIS: &str = "~/Repositories/lunaris-sys";
+    const LUNARIS_FILE: &str = "~/Repositories/lunaris-sys/foo.rs";
 
     #[test]
     fn path_within_respects_component_boundaries() {
@@ -137,12 +170,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proposes_the_matching_project() {
-        let g = projects(&[("proj-a", "~/Repositories/lunaris-sys"), ("proj-b", "~/Other")]);
-        match run(&g, "~/Repositories/lunaris-sys/foo.rs").await {
+    async fn proposes_the_matching_project_with_operands() {
+        let g = projects(&[("proj-a", LUNARIS), ("proj-b", "~/Other")]);
+        match run(&g, LUNARIS_FILE).await {
             HandlerOutcome::Propose(action) => {
                 assert_eq!(action.tool, "graph.write");
                 assert!(action.summary.contains("proj-a"));
+                // The file operand is the path (the File node id by convention);
+                // the project operand is the matched project id.
+                assert_eq!(action.arguments.get("file").map(String::as_str), Some(LUNARIS_FILE));
+                assert_eq!(action.arguments.get("project").map(String::as_str), Some("proj-a"));
             }
             other => panic!("expected a proposal, got {other:?}"),
         }
@@ -151,18 +188,21 @@ mod tests {
     #[tokio::test]
     async fn most_specific_nested_project_wins() {
         let g = projects(&[
-            ("outer", "~/Repositories/lunaris-sys"),
+            ("outer", LUNARIS),
             ("inner", "~/Repositories/lunaris-sys/desktop-shell"),
         ]);
         match run(&g, "~/Repositories/lunaris-sys/desktop-shell/src/x.rs").await {
-            HandlerOutcome::Propose(action) => assert!(action.summary.contains("inner")),
+            HandlerOutcome::Propose(action) => {
+                assert!(action.summary.contains("inner"));
+                assert_eq!(action.arguments.get("project").map(String::as_str), Some("inner"));
+            }
             other => panic!("expected the inner project, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn no_match_and_ambiguous_reach_terminals() {
-        let none = projects(&[("proj-a", "~/Repositories/lunaris-sys")]);
+        let none = projects(&[("proj-a", LUNARIS)]);
         assert!(matches!(
             run(&none, "~/Downloads/x.pdf").await,
             HandlerOutcome::Terminal(t) if t == "no_matching_project"
@@ -178,11 +218,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_graph_error_propagates_as_handler_error() {
-        let g = FakeGraph(Err(()));
-        let err = AutoTagByProject
-            .run(&opened("~/Repositories/lunaris-sys/foo.rs"), &g)
-            .await
-            .unwrap_err();
+        let g = Graph {
+            projects: vec![],
+            err: true,
+        };
+        let err = AutoTagByProject.run(&opened(LUNARIS_FILE), &g).await.unwrap_err();
         assert!(format!("{err}").contains("boom"));
     }
 }

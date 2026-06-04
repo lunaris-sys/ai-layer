@@ -63,15 +63,15 @@ use lunaris_ai_core::mcp::{AlwaysConfirm, AlwaysConfirmReason};
 use crate::seams::GateObserver;
 
 /// An action a behaviour proposes. Carries only what a proposer may
-/// legitimately state — the tool/operation it wants to invoke and a
-/// human-facing summary. It deliberately carries **no authorization
-/// inputs**: not the target app id, not a risk class, not an
-/// external-content flag. Every input that steers the gate decision is
-/// trusted and arrives via [`ActionContext`], never the proposal — an
-/// untrusted proposal must not be able to pick which per-app grant
-/// applies, label its own risk, or claim non-external provenance. The
-/// `summary` is for the proposal/preview UI and is never audited (the
-/// audit subject is content-free).
+/// legitimately state — the tool/operation it wants to invoke, a
+/// human-facing summary, and the operands (arguments) the invocation will
+/// use. It deliberately carries **no authorization inputs**: not the target
+/// app id, not a risk class, not an external-content flag. Every input that
+/// steers the gate decision is trusted and arrives via [`ActionContext`],
+/// never the proposal — an untrusted proposal must not be able to pick which
+/// per-app grant applies, label its own risk, or claim non-external
+/// provenance. The `summary` is for the proposal/preview UI and is never
+/// audited (the audit subject is content-free).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProposedAction {
     /// The MCP tool / operation the behaviour wants to invoke. Classified
@@ -81,6 +81,13 @@ pub struct ProposedAction {
     pub tool: String,
     /// Human-facing description for the proposal/preview surface.
     pub summary: String,
+    /// The action's operands, as parameter-name to value (a node id or a
+    /// path literal). These are **untrusted** — the proposer states them —
+    /// so they prove nothing on their own; the predict-before-act step checks
+    /// them against the action's trusted, registry-resolved schema and the
+    /// real graph before any execution cap is lifted. Empty when the proposer
+    /// states no operands (the action can then only be suggested, not proven).
+    pub arguments: BTreeMap<String, String>,
 }
 
 /// The **trusted** context for a gate decision, resolved by the dispatcher
@@ -283,6 +290,7 @@ mod tests {
         ProposedAction {
             tool: "graph.write".to_string(),
             summary: "tag foo.rs as part of lunaris-sys".to_string(),
+            arguments: BTreeMap::new(),
         }
     }
 
@@ -347,6 +355,7 @@ mod tests {
             let act = ProposedAction {
                 tool: tool.to_string(),
                 summary: "x".to_string(),
+                arguments: BTreeMap::new(),
             };
             let receipt = Gate::new(&cap, &audit, &obs)
                 .decide_action(
