@@ -16,6 +16,7 @@ pub mod gate;
 pub mod graph;
 pub mod handlers;
 pub mod loader;
+mod registry;
 pub mod router;
 pub mod seams;
 pub mod slice;

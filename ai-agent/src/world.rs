@@ -218,6 +218,22 @@ pub enum Predicate {
         /// The directory the path must lie within (a canonical absolute path).
         prefix: String,
     },
+    /// The path in `inner_field` of the entity bound to `inner` lies within the
+    /// directory path in `outer_field` of the entity bound to `outer`, by
+    /// component-boundary containment. Unlike [`Predicate::PathUnder`] (whose
+    /// directory is a fixed literal), this relates two nodes' path fields, so
+    /// it can express "this file is under that project's root". Both paths must
+    /// be canonical absolute, resolved at the ingestion boundary.
+    PathUnderField {
+        /// Binding for the entity holding the inner (contained) path.
+        inner: String,
+        /// The field on `inner` holding the inner path.
+        inner_field: String,
+        /// Binding for the entity holding the outer (containing) directory.
+        outer: String,
+        /// The field on `outer` holding the outer directory path.
+        outer_field: String,
+    },
     /// The capability layer permits the acting application to *execute* this
     /// action without a mandatory confirmation gate. The action's risk class
     /// is the trusted one in [`EvalContext::action_kind`] (classified from the
@@ -507,6 +523,19 @@ fn eval(p: &Predicate, b: &Bindings, s: &WorldState, ctx: &EvalContext) -> Optio
             let path = s.node(id)?.fields.get(field)?;
             path_under(path, prefix)
         }
+        // Component-aware containment between two nodes' path fields. Unknown
+        // (so the precondition fails) when any binding/field is absent, or when
+        // either path is not a canonical absolute path.
+        Predicate::PathUnderField {
+            inner,
+            inner_field,
+            outer,
+            outer_field,
+        } => {
+            let inner_path = s.node(b.get(inner)?)?.fields.get(inner_field)?;
+            let outer_path = s.node(b.get(outer)?)?.fields.get(outer_field)?;
+            path_under(inner_path, outer_path)
+        }
         // The capability is always available, so this is always known.
         // "Allows" means the agent is authorised to *execute* the kind
         // (Supervised preview or Autonomous), not merely to suggest it:
@@ -733,6 +762,46 @@ mod tests {
         assert!(matches!(
             p,
             Prediction::PreconditionsFailed { failed } if matches!(failed.as_slice(), [Predicate::PathUnder { .. }])
+        ));
+    }
+
+    #[test]
+    fn path_under_field_relates_two_node_paths() {
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let schema = ActionSchema {
+            action: "graph.write".to_string(),
+            preconditions: vec![Predicate::PathUnderField {
+                inner: "file".to_string(),
+                inner_field: "path".to_string(),
+                outer: "proj".to_string(),
+                outer_field: "root_path".to_string(),
+            }],
+            effects: vec![],
+            provenance: Provenance::Given,
+        };
+        // The file lies under the project root: the relation holds.
+        let under = WorldState::new()
+            .with_node(Node::new("f1", "File").with_field("path", "/home/tim/repos/proj/foo.rs"))
+            .with_node(Node::new("p1", "Project").with_field("root_path", "/home/tim/repos/proj"));
+        assert!(predict(
+            &schema,
+            &bindings(&[("file", "f1"), ("proj", "p1")]),
+            &under,
+            &ctx(&cap, "graph.write")
+        )
+        .is_valid());
+        // A sibling project root does not contain it (component-aware).
+        let sibling = WorldState::new()
+            .with_node(Node::new("f1", "File").with_field("path", "/home/tim/repos/proj2/foo.rs"))
+            .with_node(Node::new("p1", "Project").with_field("root_path", "/home/tim/repos/proj"));
+        assert!(matches!(
+            predict(
+                &schema,
+                &bindings(&[("file", "f1"), ("proj", "p1")]),
+                &sibling,
+                &ctx(&cap, "graph.write")
+            ),
+            Prediction::PreconditionsFailed { .. }
         ));
     }
 

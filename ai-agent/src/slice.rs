@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 use lunaris_ai_core::graph_schema::{FieldType, GraphSchema};
 use serde_json::Value;
 
+use crate::registry::TrustedActionSchema;
 use crate::seams::GraphHandle;
 use crate::world::{ActionSchema, Bindings, Effect, Node, Predicate, Provenance, WorldState};
 
@@ -489,6 +490,19 @@ impl SliceSpec {
                 self.add_ident(field);
                 self.mark_node(bind);
             }
+            Predicate::PathUnderField {
+                inner,
+                inner_field,
+                outer,
+                outer_field,
+            } => {
+                self.add_path_field(inner, inner_field);
+                self.add_path_field(outer, outer_field);
+                self.add_ident(inner_field);
+                self.add_ident(outer_field);
+                self.mark_node(inner);
+                self.mark_node(outer);
+            }
             // The capability layer is consulted directly, not loaded.
             Predicate::CapabilityAllows => {}
             // The bound value is a path literal, not a node; it must be
@@ -542,13 +556,14 @@ impl SliceSpec {
 /// `action_id` is the trusted id of the action actually being invoked. The
 /// schema's `action` must match it and its provenance must be trusted, both
 /// checked before any read, so an unrelated or unapproved schema cannot drive
-/// graph reads it would only be rejected for later. These checks are a floor,
-/// not the trust boundary: the schema must already have been resolved from the
-/// trusted given-rule registry by the (crate-internal) caller. This function
-/// is therefore `pub(crate)` — it touches the graph and must not be handed a
-/// raw, possibly model-controlled schema. The unforgeable registry-resolved
-/// schema type that makes that impossible by construction is a later increment
-/// (the gate-integration boundary).
+/// graph reads it would only be rejected for later.
+///
+/// This is the private inner builder, taking a raw [`ActionSchema`]. It is not
+/// reachable outside this module: the only entry the gate path uses is
+/// [`build_slice_trusted`], which requires a registry-resolved
+/// [`TrustedActionSchema`], so a raw, possibly model-controlled schema can
+/// never reach these graph reads. The action and provenance checks below
+/// remain as a defensive floor.
 ///
 /// Loads only what the schema's predicates and effects reference: the bound
 /// nodes (by id, with their declared label), the fields the predicates read,
@@ -588,7 +603,7 @@ impl SliceSpec {
 /// optimistic concurrency plus a short prediction lifetime). That executor
 /// does not exist yet (this is suggest-mode), so it is a documented boundary,
 /// not something `build_slice` can enforce.
-pub(crate) async fn build_slice(
+async fn build_slice(
     schema: &ActionSchema,
     action_id: &str,
     bindings: &Bindings,
@@ -811,6 +826,21 @@ pub(crate) async fn build_slice(
     Ok((state, out_bindings))
 }
 
+/// Build a slice for a registry-resolved trusted schema. This is the only
+/// way the gate path reaches the slice builder: it requires a
+/// [`TrustedActionSchema`] (which the registry alone constructs), so a raw,
+/// possibly model-controlled schema can never drive these graph reads.
+pub(crate) async fn build_slice_trusted(
+    trusted: &TrustedActionSchema,
+    action_id: &str,
+    bindings: &Bindings,
+    graph: &dyn GraphHandle,
+    paths: &dyn PathResolver,
+    mounts: &dyn MountPolicy,
+) -> Result<(WorldState, Bindings), SliceError> {
+    build_slice(trusted.schema(), action_id, bindings, graph, paths, mounts).await
+}
+
 /// Convert a graph cell to the string form the world state stores. A null or
 /// non-scalar cell has no string value (the field is omitted, so a
 /// comparison over it fails closed).
@@ -976,6 +1006,15 @@ fn validate_predicate_against_kg(
     match p {
         Predicate::FieldCmp { bind, field, .. } | Predicate::PathUnder { bind, field, .. } => {
             check_field(labels, kg, bind, field)
+        }
+        Predicate::PathUnderField {
+            inner,
+            inner_field,
+            outer,
+            outer_field,
+        } => {
+            check_field(labels, kg, inner, inner_field)?;
+            check_field(labels, kg, outer, outer_field)
         }
         Predicate::EdgeExists { from, edge, to } => check_edge(labels, kg, from, edge, to),
         Predicate::Not(inner) => validate_predicate_against_kg(inner, labels, kg),
@@ -2150,6 +2189,84 @@ tmpfs /tmp\\040dir tmpfs rw 0 0
         };
         let (r, _) = run(bad_edge, vec![("f", "f1"), ("p", "p1")]).await;
         assert!(matches!(r, Err(SliceError::SchemaViolation(_))));
+    }
+
+    // The graph.write registry rule needs the file's path under the project's
+    // root, both nodes present, and the edge absent.
+    fn graph_write_graph(file_path: &str) -> MockGraph {
+        MockGraph::new()
+            .on(
+                "n:File {id: 'f1'}",
+                vec![row(&[
+                    ("id", Value::String("f1".into())),
+                    ("path", Value::String(file_path.into())),
+                ])],
+            )
+            .on(
+                "n:Project {id: 'p1'}",
+                vec![row(&[
+                    ("id", Value::String("p1".into())),
+                    ("root_path", Value::String("/home/tim/proj".into())),
+                ])],
+            )
+            .on("count(*) AS cnt", vec![row(&[("cnt", serde_json::json!(0))])])
+    }
+
+    #[tokio::test]
+    async fn build_slice_trusted_runs_through_the_registry() {
+        // The gate path's entry: a registry-resolved schema drives the slice.
+        // The file lies under the project root, so the link is provable.
+        let trusted = crate::registry::lookup("graph.write").expect("graph.write registered");
+        let graph = graph_write_graph("/raw/under");
+        let resolver = MockResolver::new(&[
+            ("/raw/under", "/home/tim/proj/foo.rs"),
+            ("/home/tim/proj", "/home/tim/proj"),
+        ]);
+        let (state, bnd) = build_slice_trusted(
+            &trusted,
+            "graph.write",
+            &bindings(&[("file", "f1"), ("project", "p1")]),
+            &graph,
+            &resolver,
+            &StaticMountPolicy::empty(),
+        )
+        .await
+        .unwrap();
+        let cap = capability();
+        let p = predict(trusted.schema(), &bnd, &state, &ctx(&cap, "graph.write"));
+        assert!(p.is_valid(), "expected Valid, got {p:?}");
+    }
+
+    #[tokio::test]
+    async fn the_registry_rule_refuses_a_file_outside_the_project_root() {
+        // A file that does NOT lie under the project root must not validate:
+        // the rule proves project membership, not merely that both nodes exist.
+        let trusted = crate::registry::lookup("graph.write").unwrap();
+        let graph = graph_write_graph("/raw/outside");
+        let resolver = MockResolver::new(&[
+            ("/raw/outside", "/home/tim/elsewhere/foo.rs"),
+            ("/home/tim/proj", "/home/tim/proj"),
+        ]);
+        let (state, bnd) = build_slice_trusted(
+            &trusted,
+            "graph.write",
+            &bindings(&[("file", "f1"), ("project", "p1")]),
+            &graph,
+            &resolver,
+            &StaticMountPolicy::empty(),
+        )
+        .await
+        .unwrap();
+        let cap = capability();
+        let p = predict(trusted.schema(), &bnd, &state, &ctx(&cap, "graph.write"));
+        assert!(
+            matches!(
+                &p,
+                Prediction::PreconditionsFailed { failed }
+                    if failed.iter().any(|x| matches!(x, Predicate::PathUnderField { .. }))
+            ),
+            "expected the path-containment precondition to fail, got {p:?}"
+        );
     }
 
     #[test]
