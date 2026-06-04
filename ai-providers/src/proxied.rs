@@ -39,6 +39,12 @@ pub struct ProxiedConfig {
     /// in its audit log; Phase 9-γ S15 validates it against the
     /// caller's identity.
     pub audit_token: String,
+    /// The configured model's usable input context window, in tokens.
+    /// Callers that must keep a prompt inside the window (the agent
+    /// loop's compaction) read it through [`AIProvider::context_window`].
+    /// It is configured per deployment because it is a property of the
+    /// chosen model, which the proxy catalog does not carry.
+    pub context_window: u32,
 }
 
 /// D-Bus client for `org.lunaris.AIProxy1`.
@@ -142,16 +148,7 @@ impl AIProvider for ProxiedProvider {
         &self,
         req: CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
-        let body = ChatRequest {
-            model: &self.config.model,
-            messages: vec![ChatMessage {
-                role: "user",
-                content: &req.prompt,
-            }],
-            stream: false,
-        };
-        let body_json = serde_json::to_string(&body)
-            .map_err(|err| ProviderError::Internal(format!("body serialise: {err}")))?;
+        let body_json = chat_body_json(&self.config.model, &req.prompt, &req.extras)?;
 
         let resp = self
             .client
@@ -205,6 +202,38 @@ impl AIProvider for ProxiedProvider {
     fn name(&self) -> &str {
         &self.config.name
     }
+
+    fn context_window(&self) -> u32 {
+        self.config.context_window
+    }
+}
+
+/// Build the OpenAI-compatible chat request body for one prompt. The caller's
+/// advisory output cap (`extras.max_tokens`, set by the agent loop from its
+/// remaining budget and the context window) is forwarded as the request's
+/// `max_tokens`, so the upstream is bounded at generation time rather than
+/// only by the caller discarding an over-budget response after the fact. A
+/// missing or non-integer cap is simply omitted.
+fn chat_body_json(
+    model: &str,
+    prompt: &str,
+    extras: &serde_json::Value,
+) -> Result<String, ProviderError> {
+    let max_tokens = extras
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+    let body = ChatRequest {
+        model,
+        messages: vec![ChatMessage {
+            role: "user",
+            content: prompt,
+        }],
+        stream: false,
+        max_tokens,
+    };
+    serde_json::to_string(&body)
+        .map_err(|err| ProviderError::Internal(format!("body serialise: {err}")))
 }
 
 fn map_zbus_error(err: zbus::Error) -> ProviderError {
@@ -230,6 +259,10 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
     stream: bool,
+    /// The upstream output cap (OpenAI-compatible `max_tokens`); omitted when
+    /// the caller set none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -259,4 +292,34 @@ struct ChatChoiceMessage {
 struct ChatUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_body_forwards_the_output_cap_from_extras() {
+        let body = chat_body_json(
+            "llama3:8b",
+            "hello",
+            &serde_json::json!({ "max_tokens": 256 }),
+        )
+        .expect("serialises");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["model"], "llama3:8b");
+        assert_eq!(v["messages"][0]["content"], "hello");
+        assert_eq!(v["max_tokens"], 256);
+    }
+
+    #[test]
+    fn chat_body_omits_the_cap_when_absent_or_unrepresentable() {
+        // No cap at all.
+        let body = chat_body_json("m", "p", &serde_json::json!({})).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&body).unwrap().get("max_tokens").is_none());
+        // A cap that does not fit u32 is dropped rather than truncated.
+        let huge = serde_json::json!({ "max_tokens": (u64::from(u32::MAX) + 1) });
+        let body = chat_body_json("m", "p", &huge).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&body).unwrap().get("max_tokens").is_none());
+    }
 }

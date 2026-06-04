@@ -26,6 +26,7 @@ os-sdk = { path = "../../sdk/os-sdk" }
 prost = "0.13"
 async-trait = "0.1"
 futures = "0.3"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 audit-proto = { path = "../../audit-proto", features = ["test-util"] }

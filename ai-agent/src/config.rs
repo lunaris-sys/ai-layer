@@ -11,6 +11,27 @@ use serde::Deserialize;
 
 use crate::loader::Provenance;
 
+/// The LLM provider the agent loop drives, resolved from `ai.toml`. A
+/// `kind: agent` behaviour cannot run without one, so `None` keeps agent
+/// behaviours skipped (the same fail-closed posture as a disabled daemon).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSettings {
+    /// Catalogued provider name the proxy forwards to (the shared
+    /// `ai.provider` key).
+    pub name: String,
+    /// Model identifier (`[provider] model`).
+    pub model: String,
+    /// The model's usable input context window, in tokens
+    /// (`[provider] context_window`). Defaults to a conservative low value
+    /// when omitted, so an under-specified provider compacts early and fails
+    /// closed rather than overflowing.
+    pub context_window: u32,
+    /// Capability token presented to the proxy (`[provider] audit_token`).
+    /// Defaults to a fixed agent token; the proxy only records it until
+    /// Phase 9-γ S15 validates it against the caller identity.
+    pub audit_token: String,
+}
+
 /// The agent's resolved runtime configuration.
 pub struct AgentConfig {
     /// Behaviour name to the provenance it was approved for (the loader
@@ -20,6 +41,9 @@ pub struct AgentConfig {
     pub read_tier: AccessTier,
     /// The per-application action permissions (baseline + autonomous apps).
     pub actions: ActionPermissions,
+    /// The LLM provider for `kind: agent` behaviours, if one is configured
+    /// and AI is enabled. `None` means agent behaviours cannot run.
+    pub provider: Option<ProviderSettings>,
 }
 
 #[derive(Deserialize, Default)]
@@ -32,6 +56,10 @@ struct RawAi {
     action_mode: Option<String>,
     #[serde(default)]
     autonomous_apps: Vec<String>,
+    /// The catalogued provider name, shared with the rest of the product
+    /// (`ai.provider`, written by Settings, read by `ai-daemon`).
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -41,20 +69,45 @@ struct RawAgent {
 }
 
 #[derive(Deserialize, Default)]
+struct RawProvider {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    audit_token: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
 struct RawConfig {
     #[serde(default)]
     ai: RawAi,
     #[serde(default)]
     agent: RawAgent,
+    #[serde(default)]
+    provider: RawProvider,
 }
 
+/// Default model when `[provider] model` is omitted. Matches the catalogued
+/// `ollama-default` backend (and `ai-daemon`'s hardcoded model), so a config
+/// that only names the provider works out of the box.
+const DEFAULT_MODEL: &str = "llama3:8b";
+/// Conservative fallback window when `[provider] context_window` is omitted:
+/// low enough that an under-specified provider compacts early and never
+/// overflows. A deployment sets the model's real window.
+const DEFAULT_CONTEXT_WINDOW: u32 = 8_192;
+/// Fixed token presented to the proxy when `[provider] audit_token` is omitted.
+const DEFAULT_AUDIT_TOKEN: &str = "ai-agent-default-token";
+
 impl AgentConfig {
-    /// The safe default: disabled, no graph read, suggest-only actions.
+    /// The safe default: disabled, no graph read, suggest-only actions, no
+    /// provider (so agent behaviours cannot run).
     pub fn fail_closed() -> Self {
         Self {
             enabled: BTreeMap::new(),
             read_tier: AccessTier::Minimal,
             actions: ActionPermissions::suggest_only(),
+            provider: None,
         }
     }
 
@@ -84,10 +137,30 @@ impl AgentConfig {
             .as_deref()
             .map(BaselineMode::parse)
             .unwrap_or(BaselineMode::Suggest);
+        // A provider is wired only when one is named via the shared
+        // `ai.provider` key (so the standard Settings-authored config wires
+        // it, and a bare `[ai] enabled` without a provider stays workflow-only
+        // rather than guessing a backend). The model, window, and token fall
+        // back to safe defaults matching the catalogued backend when an
+        // optional `[provider]` section does not override them.
+        let provider = raw
+            .ai
+            .provider
+            .filter(|name| !name.is_empty())
+            .map(|name| ProviderSettings {
+                name,
+                model: raw.provider.model.unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+                context_window: raw.provider.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
+                audit_token: raw
+                    .provider
+                    .audit_token
+                    .unwrap_or_else(|| DEFAULT_AUDIT_TOKEN.to_string()),
+            });
         Self {
             enabled,
             read_tier: access_tier_from_level(raw.ai.access_level),
             actions: ActionPermissions::new(baseline, raw.ai.autonomous_apps),
+            provider,
         }
     }
 }
@@ -145,5 +218,58 @@ enabled = ["auto-tag-by-project"]
         let cfg = AgentConfig::parse("[ai]\nenabled = true\naction_mode = \"autonomous\"\n");
         // A global autonomous request collapses to the safe baseline.
         assert!(!cfg.actions.is_autonomous("any.app"));
+    }
+
+    #[test]
+    fn the_standard_settings_config_wires_a_provider() {
+        // The shape the Settings UI writes: [ai] enabled + provider. The agent
+        // must wire a provider from it, with safe default model/window/token.
+        let cfg = AgentConfig::parse("[ai]\nenabled = true\nprovider = \"ollama-default\"\n");
+        let p = cfg.provider.expect("ai.provider wires a provider");
+        assert_eq!(p.name, "ollama-default");
+        assert_eq!(p.model, DEFAULT_MODEL);
+        assert_eq!(p.context_window, DEFAULT_CONTEXT_WINDOW);
+        assert_eq!(p.audit_token, DEFAULT_AUDIT_TOKEN);
+    }
+
+    #[test]
+    fn a_provider_section_overrides_the_model_window_and_token() {
+        let cfg = AgentConfig::parse(
+            r#"
+[ai]
+enabled = true
+provider = "my-cloud"
+
+[provider]
+model = "claude-opus-4-8"
+context_window = 200000
+audit_token = "tok-123"
+"#,
+        );
+        let p = cfg.provider.expect("a provider is configured");
+        assert_eq!(p.name, "my-cloud");
+        assert_eq!(p.model, "claude-opus-4-8");
+        assert_eq!(p.context_window, 200000);
+        assert_eq!(p.audit_token, "tok-123");
+    }
+
+    #[test]
+    fn no_provider_without_a_named_provider() {
+        // A bare enabled config (no ai.provider), and an empty name, stay
+        // workflow-only rather than guessing a backend.
+        for text in [
+            "[ai]\nenabled = true\n",
+            "[ai]\nenabled = true\nprovider = \"\"\n",
+        ] {
+            assert!(AgentConfig::parse(text).provider.is_none(), "config: {text:?}");
+        }
+    }
+
+    #[test]
+    fn ai_disabled_yields_no_provider_even_when_named() {
+        // The master switch off must leave nothing runnable, including a named
+        // provider.
+        let cfg = AgentConfig::parse("[ai]\nenabled = false\nprovider = \"ollama-default\"\n");
+        assert!(cfg.provider.is_none());
     }
 }

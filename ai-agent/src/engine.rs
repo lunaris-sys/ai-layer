@@ -629,8 +629,10 @@ impl<'a> Dispatcher<'a> {
 /// non-nested label *lenses* (e.g. project-scoped grants `Project` but
 /// time-scoped does not), so a precise superset check needs the schema and
 /// belongs to the read/grounding layer; this conservative form never
-/// over-grants (it may refuse a satisfiable combination, fail-safe).
-fn reads_satisfied(needs: ReadScope, granted: AccessTier) -> bool {
+/// over-grants (it may refuse a satisfiable combination, fail-safe). Exposed
+/// so the daemon can compute the same dispatch eligibility before deciding
+/// whether a behaviour is runnable or needs a provider wired.
+pub fn reads_satisfied(needs: ReadScope, granted: AccessTier) -> bool {
     needs == ReadScope::Minimal || granted == AccessTier::Full || needs.tier() == granted
 }
 

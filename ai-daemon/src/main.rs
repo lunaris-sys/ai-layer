@@ -114,6 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 name: settings.provider.clone(),
                 model: "llama3:8b".to_string(),
                 audit_token: "ai-daemon-default-token".to_string(),
+                // llama3:8b ships an 8192-token context window.
+                context_window: 8_192,
             },
             &connection,
         )
