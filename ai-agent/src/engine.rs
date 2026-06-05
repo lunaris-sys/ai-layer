@@ -72,6 +72,12 @@ const MAX_COALESCE_ENTRIES: usize = 4096;
 /// classifier work against a hostile oversized field.
 const MAX_SCREEN_BYTES: usize = 64 * 1024;
 
+/// How many times the agent loop tolerates the model proposing the identical
+/// action consecutively before stopping for no progress. Counts repeats after
+/// the first sighting, so the model gets this many chances to break the loop
+/// before the run ends (here: propose X, X again, X again -> stop on the third).
+const MAX_REPEATED_PROPOSALS: u32 = 2;
+
 /// Upper bound on one injection-screen scoring call. ONNX inference on bounded
 /// input is milliseconds, so this is generous headroom; its job is to stop a
 /// wedged or pathologically slow classifier from pinning the dispatch loop (and
@@ -796,6 +802,13 @@ impl<'a> Dispatcher<'a> {
         let mut outcomes = Vec::new();
         let mut transcript: Vec<TranscriptEntry> = Vec::new();
         let mut tokens_spent: u32 = 0;
+        // Repetition / no-progress guard (technique adapted from goose's
+        // tool_monitor, Apache-2.0): the last proposed action and how many times
+        // running it has been re-proposed identically. A model stuck re-proposing
+        // the same action (e.g. one the gate keeps refusing) otherwise burns the
+        // whole step/token/wall budget making no progress.
+        let mut last_proposal: Option<(String, String)> = None;
+        let mut repeated_proposals: u32 = 0;
         // The model's input window, from the wired provider, so the
         // context-window guard tracks the real backend rather than a guess.
         let window = provider.context_window();
@@ -962,6 +975,24 @@ impl<'a> Dispatcher<'a> {
                     return outcomes;
                 }
                 AgentStep::Propose { tool, summary } => {
+                    // No-progress guard: if the model proposes the identical
+                    // action several steps running, it is stuck, so stop early
+                    // rather than spend the rest of the budget on it. A
+                    // deterministic check inside the budget, no model call.
+                    let signature = (tool.clone(), summary.clone());
+                    if last_proposal.as_ref() == Some(&signature) {
+                        repeated_proposals += 1;
+                    } else {
+                        repeated_proposals = 0;
+                        last_proposal = Some(signature);
+                    }
+                    if repeated_proposals >= MAX_REPEATED_PROPOSALS {
+                        outcomes.push(DispatchOutcome::Terminal {
+                            behaviour,
+                            outcome: "no_progress".to_string(),
+                        });
+                        return outcomes;
+                    }
                     // One distinct correlation id per step, so each step's
                     // gate/audit entry is a separate, ordered ledger record.
                     let correlation_id = format!("{}:{}:step-{step}", event.id, behaviour);
@@ -2256,6 +2287,46 @@ trigger:
         let outcomes = d.dispatch(&event("~/foo.rs")).await;
         assert!(outcomes.iter().any(|o| matches!(o, DispatchOutcome::Decided { .. })));
         assert!(!outcomes.iter().any(|o| matches!(o, DispatchOutcome::Blocked { .. })));
+    }
+
+    #[tokio::test]
+    async fn agent_loop_stops_on_repeated_identical_proposals() {
+        // A high step budget, but the model proposes the identical action every
+        // step (never stops on its own). The no-progress guard must end the run
+        // well before the budget, on the third identical proposal.
+        let behaviours = [loaded(&agent_skill(10, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![
+            propose("graph.write"),
+            propose("graph.write"),
+            propose("graph.write"),
+            propose("graph.write"),
+        ]);
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        );
+
+        let outcomes = d.dispatch(&event("~/foo.rs")).await;
+        // The first two identical proposals are gated; the third trips the guard.
+        assert!(outcomes.len() < 10, "stopped before the step budget");
+        assert!(matches!(
+            outcomes.last().unwrap(),
+            DispatchOutcome::Terminal { outcome, .. } if outcome == "no_progress"
+        ));
+        assert_eq!(
+            outcomes.iter().filter(|o| matches!(o, DispatchOutcome::Decided { .. })).count(),
+            2
+        );
     }
 
     #[tokio::test]
