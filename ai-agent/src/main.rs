@@ -23,7 +23,7 @@ use tokio::sync::watch;
 
 use lunaris_ai_agent::behaviour::{BehaviourKind, ReadScope};
 use lunaris_ai_agent::config::{AgentConfig, ProviderSettings};
-use lunaris_ai_agent::engine::{reads_satisfied, DispatchOutcome, Dispatcher};
+use lunaris_ai_agent::engine::{reads_satisfied, DispatchOutcome, Dispatcher, ScreeningMode};
 use lunaris_ai_agent::gate::Gate;
 use lunaris_ai_agent::slice::{FsPathResolver, ProcMountsPolicy};
 use lunaris_ai_agent::graph::{UnixGraph, DEFAULT_GRAPH_SOCKET};
@@ -31,6 +31,9 @@ use lunaris_ai_agent::handlers::builtin_handlers;
 use lunaris_ai_agent::loader::{load, BehaviourSource};
 use lunaris_ai_agent::seams::{AgentEvent, NullObserver, SystemClock, TriggerSource};
 use lunaris_ai_agent::source::{subscription_types, EventBusSource, DEFAULT_CONSUMER_SOCKET};
+use std::sync::Arc;
+
+use lunaris_ai_classifier::{ClassifierPolicy, InjectionClassifier};
 use lunaris_ai_core::audit::LedgerAuditSink;
 use lunaris_ai_core::capability::{AccessTier, Capability};
 use lunaris_ai_core::provider::AIProvider;
@@ -100,15 +103,200 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut connection: Option<Connection> = None;
 
     run(
-        &handlers,
-        &audit,
-        &observer,
-        &graph,
-        &ai_path,
+        Collaborators {
+            handlers: &handlers,
+            audit: &audit,
+            observer: &observer,
+            graph: &graph,
+            ai_path: &ai_path,
+        },
         &mut connection,
         shutdown_rx,
     )
     .await
+}
+
+/// The startup outcome of provisioning the prompt-injection classifier (S17),
+/// owned by `main` for the process lifetime. Distinguishes a deliberately
+/// unconfigured classifier from one that was configured but could not load, so
+/// the latter fails closed instead of silently disabling screening.
+enum ProvisionedScreening {
+    /// A classifier loaded and will screen external content. Only constructed in
+    /// the `onnx` build; matched (and mapped to `ScreeningMode::On`) in all
+    /// builds, so the default build still maps it but never produces it.
+    #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+    Classifier(Arc<dyn InjectionClassifier>, ClassifierPolicy),
+    /// A `[classifier]` was configured but could not be loaded (missing model,
+    /// bad path, invalid export, invalid thresholds) or cannot be honoured by
+    /// this binary (no `onnx` feature). External-content agent loops fail closed.
+    Unavailable,
+    /// No classifier is configured (the default build, or no `[classifier]`
+    /// section). External content flows sanitised, under the gate's
+    /// mandatory-confirmation containment.
+    NotConfigured,
+}
+
+/// Whether a `[classifier]` section's thresholds are semantically valid: both
+/// finite, within `0.0..=1.0`, and ordered (`warn_at <= block_at`). A finite
+/// but out-of-range value (a typo like `block_at = 90`) would otherwise be
+/// silently clamped by [`ClassifierPolicy::new`] to a threshold that blocks
+/// almost nothing, a fail-open weakening. An invalid threshold set fails closed
+/// instead (the classifier is treated as unavailable). Pure and always
+/// compiled, so it is unit-tested without the `onnx` model.
+fn classifier_thresholds_valid(warn_at: f32, block_at: f32) -> bool {
+    warn_at.is_finite()
+        && block_at.is_finite()
+        && (0.0..=1.0).contains(&warn_at)
+        && (0.0..=1.0).contains(&block_at)
+        && warn_at <= block_at
+}
+
+/// The result of parsing the `[classifier]` section of `ai.toml`: absent
+/// (deliberately unconfigured), present and valid (with the config), or present
+/// but invalid (a typo, an unknown key, a wrong type, or out-of-range
+/// thresholds). Pure and always compiled, so the parse/validation is unit-tested
+/// without the `onnx` model; only the model *load* is feature-gated.
+enum ClassifierProvision {
+    // The config is read only in the `onnx` build (to load the model); the
+    // default build matches the variant for the fail-closed decision but never
+    // reads it.
+    Configured(#[cfg_attr(not(feature = "onnx"), allow(dead_code))] lunaris_ai_classifier::ClassifierConfig),
+    Invalid,
+    Absent,
+}
+
+/// Parse and validate the `[classifier]` section of an `ai.toml` snapshot.
+/// `deny_unknown_fields` makes a misspelled key (e.g. a typoed threshold) a
+/// parse error rather than a silently-ignored default, so a broken classifier
+/// config fails closed instead of quietly running a weaker screen.
+fn parse_classifier_config(ai_text: &str) -> ClassifierProvision {
+    use lunaris_ai_classifier::ClassifierConfig;
+
+    // `benign_label_index` is deliberately NOT a config field. The ONNX scorer
+    // computes injection probability as `1 - softmax[benign_index]`, so a wrong
+    // in-range value (e.g. 1 instead of 0) would invert the verdict and silently
+    // pass injections. All supported models (Prompt-Guard, ProtectAI DeBERTa)
+    // put benign at index 0, so it is hardcoded; with `deny_unknown_fields` any
+    // attempt to set it in config is a parse error -> Invalid -> fail closed.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawClassifier {
+        model_path: std::path::PathBuf,
+        tokenizer_path: std::path::PathBuf,
+        #[serde(default = "default_max_tokens")]
+        max_tokens: usize,
+        #[serde(default = "default_warn")]
+        warn_at: f32,
+        #[serde(default = "default_block")]
+        block_at: f32,
+    }
+    fn default_max_tokens() -> usize {
+        512
+    }
+    fn default_warn() -> f32 {
+        0.5
+    }
+    fn default_block() -> f32 {
+        0.9
+    }
+
+    // A parse failure of the *whole* document is not a configured-classifier
+    // failure: the daemon's own config load handles a malformed ai.toml
+    // (fail-closed, disabled), so treat it as "not configured" rather than
+    // blocking.
+    let Ok(doc) = toml::from_str::<toml::Table>(ai_text) else {
+        return ClassifierProvision::Absent;
+    };
+    // Distinguish an absent `[classifier]` (deliberately unconfigured, flow)
+    // from a present-but-invalid one (a typo or wrong type, fail closed):
+    // detect presence on the table, then deserialise the fields.
+    let Some(section) = doc.get("classifier") else {
+        return ClassifierProvision::Absent;
+    };
+    let rc: RawClassifier = match section.clone().try_into() {
+        Ok(rc) => rc,
+        Err(e) => {
+            tracing::error!(error = %e, "[classifier] is present but invalid (unknown key, missing or wrong-typed field); external-content agent behaviours will be blocked (fail closed) until fixed");
+            return ClassifierProvision::Invalid;
+        }
+    };
+    // Out-of-range or swapped thresholds are a config mistake, not a valid
+    // screen: fail closed rather than let the policy clamp them into near-no
+    // blocking.
+    if !classifier_thresholds_valid(rc.warn_at, rc.block_at) {
+        tracing::error!(
+            warn_at = rc.warn_at,
+            block_at = rc.block_at,
+            "[classifier] thresholds are invalid (need finite, 0.0..=1.0, warn_at <= block_at); external-content agent behaviours will be blocked (fail closed) until fixed"
+        );
+        return ClassifierProvision::Invalid;
+    }
+    ClassifierProvision::Configured(ClassifierConfig {
+        model_path: rc.model_path,
+        tokenizer_path: rc.tokenizer_path,
+        max_tokens: rc.max_tokens,
+        // Hardcoded for the supported model family (benign at index 0); not a
+        // config knob, so a typo cannot invert the verdict.
+        benign_label_index: 0,
+        warn_at: rc.warn_at,
+        block_at: rc.block_at,
+    })
+}
+
+/// Provision the prompt-injection classifier (S17) from an `ai.toml` snapshot,
+/// when the `onnx` feature is compiled in.
+///
+/// The distinction is deliberate (Codex review): a *deliberately* unconfigured
+/// classifier ([`ProvisionedScreening::NotConfigured`]) flows external content
+/// under the gate's containment, because the model is a Phase-10
+/// distro-provisioned artifact and the agent runs (in suggest-mode) before it
+/// exists. But a classifier that *was* configured and fails to load or parse is
+/// a packaging error or config typo, and degrading it to "no screening" would be
+/// fail-open, so it becomes [`ProvisionedScreening::Unavailable`] and the
+/// dispatcher blocks external-content agent loops until it is fixed.
+///
+/// Takes the already-read `ai.toml` text (not a path) so the screening posture
+/// is derived from the **same** snapshot as [`AgentConfig`]: reading the file a
+/// second time could combine enabled behaviours from one revision with a
+/// screening mode from another (a config-race fail-open).
+#[cfg(feature = "onnx")]
+fn build_screening(ai_text: &str) -> ProvisionedScreening {
+    use lunaris_ai_classifier::onnx::OnnxClassifier;
+
+    let config = match parse_classifier_config(ai_text) {
+        ClassifierProvision::Absent => return ProvisionedScreening::NotConfigured,
+        ClassifierProvision::Invalid => return ProvisionedScreening::Unavailable,
+        ClassifierProvision::Configured(config) => config,
+    };
+    match OnnxClassifier::load(&config) {
+        Ok(classifier) => {
+            tracing::info!("prompt-injection classifier loaded; external content will be screened");
+            ProvisionedScreening::Classifier(Arc::new(classifier), config.policy())
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "a [classifier] is configured but failed to load; external-content agent behaviours will be blocked (fail closed) until it is fixed");
+            ProvisionedScreening::Unavailable
+        }
+    }
+}
+
+/// Default build: no native ONNX dependency, so no classifier can be loaded.
+/// But a `[classifier]` configured in `ai.toml` (valid or not) is an operator
+/// intent this binary cannot honour, so it fails closed (Unavailable) rather
+/// than silently flowing external content unscreened, a packaging-mismatch
+/// fail-open. Absent config flows sanitised under the gate's confirmation
+/// containment.
+#[cfg(not(feature = "onnx"))]
+fn build_screening(ai_text: &str) -> ProvisionedScreening {
+    match parse_classifier_config(ai_text) {
+        ClassifierProvision::Absent => ProvisionedScreening::NotConfigured,
+        _ => {
+            tracing::error!(
+                "[classifier] is configured but this binary was built without the `onnx` feature; external-content agent behaviours will be blocked (fail closed). Rebuild with --features onnx to screen."
+            );
+            ProvisionedScreening::Unavailable
+        }
+    }
 }
 
 /// Open a session-bus connection and own [`AGENT_BUS_NAME`] as the sole,
@@ -261,17 +449,37 @@ fn agent_needs_provider(
     enabled && kind == BehaviourKind::Agent && reads_satisfied(reads, read_tier)
 }
 
+/// The process-lived collaborators the epoch loop borrows on every iteration.
+/// Grouped so [`run`]'s signature stays small as the set grows; all fields are
+/// cheap shared references, so the struct is passed by value.
+struct Collaborators<'a> {
+    handlers: &'a lunaris_ai_agent::engine::HandlerRegistry,
+    audit: &'a LedgerAuditSink,
+    observer: &'a NullObserver,
+    graph: &'a UnixGraph,
+    ai_path: &'a Path,
+}
+
 /// The epoch loop. Each iteration is one config epoch: load settings and
 /// behaviours, run the dispatcher, and rebuild on the next config change.
 async fn run(
-    handlers: &lunaris_ai_agent::engine::HandlerRegistry,
-    audit: &LedgerAuditSink,
-    observer: &NullObserver,
-    graph: &UnixGraph,
-    ai_path: &Path,
+    collab: Collaborators<'_>,
     connection: &mut Option<Connection>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let Collaborators {
+        handlers,
+        audit,
+        observer,
+        graph,
+        ai_path,
+    } = collab;
+    // Process-lived single-flight gate for classifier scoring (S17), shared
+    // into every dispatcher rebuild (config reload / provider rearm) so a
+    // scorer that wedged in a prior epoch keeps blocking new scorers until it
+    // actually finishes. A fresh per-dispatcher gate would let repeated rearms
+    // each spawn a new scorer and exhaust the blocking pool.
+    let screen_gate = Arc::new(tokio::sync::Semaphore::new(1));
     loop {
         // Arm the config watch *before* reading the config, so no settings
         // change can slip through the gap between resolving the config and
@@ -288,11 +496,39 @@ async fn run(
             }
         };
 
-        let config = load_config(ai_path);
+        // Read ai.toml once per epoch and derive BOTH the agent config and the
+        // screening posture from that single snapshot. Reading the file twice
+        // could combine enabled behaviours from one revision with a screening
+        // mode from another (a config-race fail-open), so they must share the
+        // exact same text.
+        let ai_text = std::fs::read_to_string(ai_path).ok();
+        let config = match &ai_text {
+            Some(text) => AgentConfig::parse(text),
+            None => {
+                tracing::info!("no ai.toml found; using safe defaults (agent disabled)");
+                AgentConfig::fail_closed()
+            }
+        };
         let outcome = load(&behaviour_sources(), &config.enabled);
         for err in &outcome.errors {
             tracing::warn!(error = %err, "behaviour failed to load");
         }
+
+        // Provision the injection classifier (S17) from the same snapshot, so a
+        // live `ai.toml` change to `[classifier]` takes effect at the next
+        // reload rather than only on restart (the daemon applies config live, so
+        // the screening posture must track it). The model reload cost is paid
+        // only on a config change and only in the `onnx` build; the default
+        // build's `build_screening` is a no-op. The owned classifier lives for
+        // this epoch; the dispatcher (rebuilt in the inner loop) borrows the mode.
+        let provisioned = build_screening(ai_text.as_deref().unwrap_or(""));
+        let screening: ScreeningMode = match &provisioned {
+            ProvisionedScreening::Classifier(classifier, policy) => {
+                ScreeningMode::On(Arc::clone(classifier), *policy)
+            }
+            ProvisionedScreening::Unavailable => ScreeningMode::FailClosed,
+            ProvisionedScreening::NotConfigured => ScreeningMode::Off,
+        };
 
         // Config-scoped collaborators, built once per config epoch and reused
         // across provider rebuilds: a bus recovery rebuilds only the provider
@@ -410,8 +646,13 @@ async fn run(
             // bind a compromised handler (it could reach the knowledge socket
             // directly), and B1 behaviours are trusted first-party built-ins, so
             // the coarse gate is the boundary today.
+            // S17: external-content screening mode, re-applied per epoch (the
+            // dispatcher is rebuilt on reload/provider recovery); the classifier
+            // itself is the process-lived startup resource owned by `main`.
             let dispatcher =
-                Dispatcher::new(&outcome.loaded, handlers, graph, read_tier, gate, provider, &clock);
+                Dispatcher::new(&outcome.loaded, handlers, graph, read_tier, gate, provider, &clock)
+                    .with_screening_mode(screening.clone())
+                    .with_screen_gate(Arc::clone(&screen_gate));
 
             if runnable > 0 {
                 tracing::info!(runnable, "starting agent");
@@ -647,6 +888,9 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
         DispatchOutcome::Coalesced { behaviour } => {
             tracing::debug!(behaviour = %behaviour, "behaviour dispatch coalesced (burst)")
         }
+        DispatchOutcome::Blocked { behaviour, reason } => {
+            tracing::warn!(behaviour = %behaviour, reason = %reason, "external content blocked before reaching the model")
+        }
     }
 }
 
@@ -712,18 +956,6 @@ async fn shutdown_requested(shutdown_rx: &mut watch::Receiver<bool>) {
     let _ = shutdown_rx.wait_for(|&stop| stop).await;
 }
 
-/// Load the agent config, fail-closed if it is absent or unreadable (the
-/// agent stays disabled rather than guessing).
-fn load_config(path: &Path) -> AgentConfig {
-    match std::fs::read_to_string(path) {
-        Ok(text) => AgentConfig::parse(&text),
-        Err(_) => {
-            tracing::info!("no ai.toml found; using safe defaults (agent disabled)");
-            AgentConfig::fail_closed()
-        }
-    }
-}
-
 /// The path to `ai.toml` (`LUNARIS_AI_CONFIG` overrides the default).
 fn ai_config_path() -> PathBuf {
     if let Ok(path) = std::env::var("LUNARIS_AI_CONFIG") {
@@ -787,6 +1019,70 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "onnx"))]
+    #[test]
+    fn non_onnx_build_fails_closed_when_a_classifier_is_configured() {
+        // No [classifier] table: deliberately unconfigured, flows.
+        assert!(matches!(
+            build_screening("[ai]\nenabled = true\n"),
+            ProvisionedScreening::NotConfigured
+        ));
+        // [classifier] present but this binary cannot honour it: fail closed,
+        // not silently Off.
+        assert!(matches!(
+            build_screening(
+                "[ai]\nenabled = true\n\n[classifier]\nmodel_path = \"/m\"\ntokenizer_path = \"/t\"\n"
+            ),
+            ProvisionedScreening::Unavailable
+        ));
+    }
+
+    #[test]
+    fn parse_classifier_config_distinguishes_absent_valid_and_invalid() {
+        use ClassifierProvision::{Absent, Configured, Invalid};
+        let valid = "[classifier]\nmodel_path = \"/m\"\ntokenizer_path = \"/t\"\n";
+        // Absent: no [classifier] table.
+        assert!(matches!(parse_classifier_config("[ai]\nenabled = true\n"), Absent));
+        // Valid: required fields present, defaults for the rest.
+        assert!(matches!(parse_classifier_config(valid), Configured(_)));
+        // Invalid: a misspelled key (deny_unknown_fields) must fail closed,
+        // not silently run with the default threshold.
+        let typo = "[classifier]\nmodel_path = \"/m\"\ntokenizer_path = \"/t\"\nblock_threshld = 0.5\n";
+        assert!(matches!(parse_classifier_config(typo), Invalid));
+        // Invalid: a missing required field.
+        assert!(matches!(
+            parse_classifier_config("[classifier]\nmodel_path = \"/m\"\n"),
+            Invalid
+        ));
+        // Invalid: out-of-range threshold.
+        let bad_threshold =
+            "[classifier]\nmodel_path = \"/m\"\ntokenizer_path = \"/t\"\nblock_at = 90.0\n";
+        assert!(matches!(parse_classifier_config(bad_threshold), Invalid));
+        // Invalid: benign_label_index is not a config knob (hardcoded to 0 for
+        // the supported models); setting it must fail closed, not invert the
+        // verdict via a wrong index.
+        let label_index =
+            "[classifier]\nmodel_path = \"/m\"\ntokenizer_path = \"/t\"\nbenign_label_index = 1\n";
+        assert!(matches!(parse_classifier_config(label_index), Invalid));
+    }
+
+    #[test]
+    fn classifier_thresholds_validation_fails_closed_on_bad_config() {
+        // Valid: ordered and in range.
+        assert!(classifier_thresholds_valid(0.5, 0.9));
+        assert!(classifier_thresholds_valid(0.0, 1.0));
+        assert!(classifier_thresholds_valid(0.7, 0.7));
+        // Out of range (the `block_at = 90` typo that would otherwise clamp to a
+        // near-no-blocking 1.0).
+        assert!(!classifier_thresholds_valid(0.5, 90.0));
+        assert!(!classifier_thresholds_valid(-0.1, 0.9));
+        // Swapped.
+        assert!(!classifier_thresholds_valid(0.9, 0.5));
+        // Non-finite.
+        assert!(!classifier_thresholds_valid(f32::NAN, 0.9));
+        assert!(!classifier_thresholds_valid(0.5, f32::INFINITY));
+    }
 
     #[test]
     fn a_provider_makes_an_eligible_agent_behaviour_runnable() {

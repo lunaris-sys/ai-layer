@@ -18,13 +18,15 @@
 //! follow-up that slots behind these same seams.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures::FutureExt as _;
 use lunaris_ai_core::capability::{AccessTier, ActionDecision};
 use lunaris_ai_core::provider::{AIProvider, CompletionRequest};
 
-use crate::agentic::{build_agent_prompt, parse_agent_step, AgentStep};
+use crate::agentic::{build_agent_prompt, external_screen_text, parse_agent_step, AgentStep};
+use lunaris_ai_classifier::{screen, ClassifierPolicy, InjectionClassifier, Verdict};
 use crate::behaviour::{Behaviour, BehaviourKind, ReadScope};
 use crate::compaction::{self, CompactionPolicy, TranscriptEntry};
 use crate::gate::{ActionContext, Gate, GateError, ProposedAction};
@@ -58,6 +60,20 @@ const DEFAULT_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 /// recent entries, never dropping a distinct dispatch). Comparable to the
 /// kernel-layer normaliser's dedup-map cleanup threshold.
 const MAX_COALESCE_ENTRIES: usize = 4096;
+
+/// Upper bound on the external text the injection screen (S17) will run the
+/// classifier over. Event metadata (paths, titles) is tiny; a payload past this
+/// is not normal and would force the classifier to score many windows, so it is
+/// blocked (fail closed) without running inference. Bounds the per-event
+/// classifier work against a hostile oversized field.
+const MAX_SCREEN_BYTES: usize = 64 * 1024;
+
+/// Upper bound on one injection-screen scoring call. ONNX inference on bounded
+/// input is milliseconds, so this is generous headroom; its job is to stop a
+/// wedged or pathologically slow classifier from pinning the dispatch loop (and
+/// delaying config revocation / shutdown) indefinitely. A timeout fails closed
+/// (the content is blocked).
+const SCREEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What a workflow handler decides for a matched event.
 #[derive(Debug, Clone)]
@@ -142,6 +158,16 @@ pub enum DispatchOutcome {
     Coalesced {
         /// The behaviour whose dispatch was coalesced.
         behaviour: String,
+    },
+    /// An agent behaviour was not run because the event's external content was
+    /// blocked by the injection classifier (S17): the content never reaches
+    /// the model. Only agent behaviours are screened (they alone feed content
+    /// to an LLM); the reason is content-free.
+    Blocked {
+        /// The behaviour that would have run.
+        behaviour: String,
+        /// Why it was blocked (content-free).
+        reason: String,
     },
 }
 
@@ -291,6 +317,47 @@ pub struct Dispatcher<'a> {
     /// await. Reset when the dispatcher is rebuilt (a config reload or provider
     /// recovery), which is acceptable for a burst-dedup optimisation.
     coalescer: std::sync::Mutex<Coalescer>,
+    /// How external content is screened (S17) before it can reach the model in
+    /// an agent loop. See [`ScreeningMode`]: `Off` flows under the gate's
+    /// mandatory-confirmation containment, `FailClosed` blocks external-content
+    /// agent loops (a configured-but-unavailable classifier), `On` screens.
+    screening: ScreeningMode,
+    /// Single-flight guard for classifier scoring (S17). The owned permit is
+    /// held by the blocking scorer task until it actually finishes, not just
+    /// until its timeout, so a wedged score (one that outlives [`SCREEN_TIMEOUT`])
+    /// keeps the permit and every later external event fails closed (blocks)
+    /// rather than spawning another blocking task. This bounds outstanding
+    /// scorer tasks to one and stops a wedged classifier from exhausting the
+    /// blocking pool. A fresh dispatcher (a config epoch) gets a fresh permit,
+    /// acceptable since epochs are rare and a wedge is pathological.
+    screen_gate: Arc<tokio::sync::Semaphore>,
+}
+
+/// How the dispatcher screens external content for prompt injection (S17).
+///
+/// The three states keep a configured-but-broken classifier from silently
+/// degrading to no screening: a packaging error or config typo must fail
+/// closed, while a deliberately unprovisioned classifier (the default build or
+/// no `[classifier]` section) flows under the gate's always-on
+/// confirm-on-external-trigger containment.
+///
+/// The classifier is held as an `Arc` (not a borrow) so scoring can run on a
+/// bounded blocking task: ONNX inference is a blocking native call, and running
+/// it inline would pin the dispatch poll so config revocation and shutdown
+/// could not preempt it. The `Arc` is cheap to clone into that task.
+#[derive(Clone)]
+pub enum ScreeningMode {
+    /// No classifier provisioned (default build, or no `[classifier]` config).
+    /// External content is sanitised (S18-B) and flows; the gate's mandatory
+    /// confirmation for externally-triggered actions is the containment.
+    Off,
+    /// A classifier was configured but could not be loaded (missing model,
+    /// bad path, unreadable export, invalid thresholds). External content cannot
+    /// be screened, so it is blocked from reaching the model: an intended screen
+    /// that is broken fails closed rather than silently disabling S17.
+    FailClosed,
+    /// Screen with this classifier and threshold policy.
+    On(Arc<dyn InjectionClassifier>, ClassifierPolicy),
 }
 
 impl<'a> Dispatcher<'a> {
@@ -315,6 +382,8 @@ impl<'a> Dispatcher<'a> {
             clock,
             compaction: CompactionPolicy::default(),
             coalescer: std::sync::Mutex::new(Coalescer::new(DEFAULT_COALESCE_WINDOW)),
+            screening: ScreeningMode::Off,
+            screen_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -322,6 +391,38 @@ impl<'a> Dispatcher<'a> {
     /// window once a provider is wired).
     pub fn with_compaction(mut self, policy: CompactionPolicy) -> Self {
         self.compaction = policy;
+        self
+    }
+
+    /// Set the external-content screening mode (S17). [`ScreeningMode::Off`]
+    /// (the default) flows external content under the gate's confirmation
+    /// containment; [`ScreeningMode::FailClosed`] blocks it; [`ScreeningMode::On`]
+    /// screens it with a classifier.
+    pub fn with_screening_mode(mut self, mode: ScreeningMode) -> Self {
+        self.screening = mode;
+        self
+    }
+
+    /// Enable prompt-injection screening (S17) of external content with the
+    /// given classifier and threshold policy. Convenience for
+    /// `with_screening_mode(ScreeningMode::On(..))`.
+    pub fn with_screening(
+        self,
+        classifier: Arc<dyn InjectionClassifier>,
+        policy: ClassifierPolicy,
+    ) -> Self {
+        self.with_screening_mode(ScreeningMode::On(classifier, policy))
+    }
+
+    /// Use a shared, process-lived single-flight gate for classifier scoring
+    /// (S17) instead of this dispatcher's own. The daemon rebuilds the
+    /// dispatcher on every config reload and provider rearm; a wedged scorer
+    /// task from a prior dispatcher keeps its permit, so passing the same gate
+    /// into each rebuild keeps the "one outstanding scorer" bound across
+    /// rebuilds (a fresh per-dispatcher gate would let repeated rearms spawn a
+    /// new scorer each time and exhaust the blocking pool).
+    pub fn with_screen_gate(mut self, gate: Arc<tokio::sync::Semaphore>) -> Self {
+        self.screen_gate = gate;
         self
     }
 
@@ -341,6 +442,12 @@ impl<'a> Dispatcher<'a> {
         // A trusted, consumer-side timestamp for coalescing: the dispatcher's
         // wall clock, taken once per event for all behaviours it matches.
         let now = self.clock.now();
+        // S17 verdict for this event's external content, computed lazily inside
+        // the admitted agent path (after matching, filters, coalescing, and the
+        // kind check) so a workflow-only, filtered, or fully-coalesced external
+        // event never runs the classifier, and cached so a burst of matched
+        // agent behaviours screens once. The content is event-level.
+        let mut external_verdict: Option<Verdict> = None;
         for lb in matching_behaviours(&event.event_type, &event.fields, self.behaviours) {
             let name = lb.behaviour.manifest.name.clone();
             // G1: coalesce a burst of identical events for this behaviour, so a
@@ -386,26 +493,123 @@ impl<'a> Dispatcher<'a> {
                 continue;
             }
             if lb.behaviour.manifest.kind == BehaviourKind::Agent {
-                match self.provider {
-                    Some(provider) => {
-                        // Each agent loop gets its own wall-clock anchor, read
-                        // here immediately before it runs, so an earlier
-                        // behaviour's runtime never eats into this loop's budget.
-                        let start = self.clock.now();
-                        outcomes
-                            .extend(self.run_agent_loop(lb, event, provider, start).await)
-                    }
-                    None => outcomes.push(DispatchOutcome::Skipped {
-                        behaviour: name,
-                        reason: "no AI provider configured; agent behaviours cannot run"
-                            .to_string(),
-                    }),
+                // Preflight every non-model eligibility check before screening:
+                // no provider (a bus outage), an over-scoped read tier, or a
+                // missing budget all skip the behaviour without reaching the
+                // model, so the classifier must not run for them (else a degraded
+                // provider or an over-scoped agent becomes a per-event classifier
+                // CPU cost on events that go nowhere).
+                if let Some(reason) =
+                    agent_skip_reason(&lb.behaviour.manifest, self.read_tier, self.provider.is_some())
+                {
+                    outcomes.push(DispatchOutcome::Skipped { behaviour: name, reason });
+                    continue;
                 }
+                // S17: blocked external content never reaches the model. The gate
+                // (and its mandatory confirmation) is downstream of the model, so
+                // blocking here, before the loop runs, is the only place that
+                // stops poisoned content from being read at all. Reached only for
+                // an eligible agent (provider present, read-scope ok, budget set),
+                // computed once per event and cached across agent behaviours.
+                if event.external_content {
+                    let verdict = match external_verdict {
+                        Some(v) => v,
+                        None => {
+                            let v = self.screen_external(event).await;
+                            // Surface a Warn: the classifier finds the content
+                            // suspicious but not blocking. Per the policy it
+                            // passes to the model, and any action it triggers is
+                            // already gated to confirmation (external_trigger), so
+                            // this logs the signal rather than dropping it. A
+                            // richer surface (audit entry, confirmation-UI flag)
+                            // is a P9 follow-up once that surface exists.
+                            if v == Verdict::Warn {
+                                tracing::warn!(
+                                    event = %event.event_type,
+                                    "external content flagged suspicious (Warn) by the injection classifier; passed to the model, any resulting action still requires confirmation"
+                                );
+                            }
+                            external_verdict = Some(v);
+                            v
+                        }
+                    };
+                    if verdict == Verdict::Block {
+                        outcomes.push(DispatchOutcome::Blocked {
+                            behaviour: name,
+                            reason: "external content blocked before reaching the model"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                }
+                let provider = self
+                    .provider
+                    .expect("agent_skip_reason returns a reason when no provider");
+                // Each agent loop gets its own wall-clock anchor, read here
+                // immediately before it runs, so an earlier behaviour's runtime
+                // never eats into this loop's budget.
+                let start = self.clock.now();
+                outcomes.extend(self.run_agent_loop(lb, event, provider, start).await);
                 continue;
             }
             outcomes.push(self.dispatch_one(lb, event).await);
         }
         outcomes
+    }
+
+    /// Screen this event's external content (S17), returning the verdict the
+    /// dispatcher acts on. `Off` is [`Verdict::Allow`] (external content flows
+    /// under the gate's confirmation containment); `FailClosed` is
+    /// [`Verdict::Block`] (a configured classifier that could not load); `On`
+    /// screens the sanitised external text and returns the classifier's verdict,
+    /// mapping a classifier error (`screen` fails closed), an oversized payload
+    /// (bounding the work), a scoring timeout/panic, or a busy single-flight
+    /// gate to [`Verdict::Block`]. Only called for an external-content event in
+    /// the admitted agent path.
+    ///
+    /// Scoring runs on a blocking task bounded by [`SCREEN_TIMEOUT`]: ONNX
+    /// inference is a blocking native call, so running it inline would pin the
+    /// dispatch poll and stop config revocation / shutdown from preempting. The
+    /// `await` here is that preemption point; a timeout or a panic in the
+    /// blocking task fails closed (block).
+    async fn screen_external(&self, event: &AgentEvent) -> Verdict {
+        match &self.screening {
+            ScreeningMode::Off => Verdict::Allow,
+            ScreeningMode::FailClosed => Verdict::Block,
+            ScreeningMode::On(classifier, policy) => {
+                let text = external_screen_text(event);
+                // Refuse (block) external content past the cap rather than run
+                // unbounded inference windows on a hostile oversized payload.
+                if text.len() > MAX_SCREEN_BYTES {
+                    return Verdict::Block;
+                }
+                // Single-flight: take the one permit, held inside the blocking
+                // task until it truly finishes. If it is unavailable a prior
+                // score is still running (wedged past its timeout), so fail
+                // closed rather than spawn another blocking task and risk
+                // exhausting the pool.
+                let Ok(permit) = Arc::clone(&self.screen_gate).try_acquire_owned() else {
+                    return Verdict::Block;
+                };
+                let classifier = Arc::clone(classifier);
+                let policy = *policy;
+                let scored = tokio::time::timeout(
+                    SCREEN_TIMEOUT,
+                    tokio::task::spawn_blocking(move || {
+                        // Hold the permit for the real duration of the native
+                        // call, so a wedge keeps blocking later scorers.
+                        let _permit = permit;
+                        screen(&*classifier, &policy, &text)
+                    }),
+                )
+                .await;
+                // Timeout (Err) or a panicked blocking task (Ok(Err)): fail closed.
+                match scored {
+                    Ok(Ok(verdict)) => verdict,
+                    _ => Verdict::Block,
+                }
+            }
+        }
     }
 
     async fn dispatch_one(&self, lb: &LoadedBehaviour, event: &AgentEvent) -> DispatchOutcome {
@@ -551,23 +755,18 @@ impl<'a> Dispatcher<'a> {
         let m = &lb.behaviour.manifest;
         let behaviour = m.name.clone();
 
-        if !reads_satisfied(m.reads, self.read_tier) {
-            return vec![DispatchOutcome::Skipped {
-                behaviour,
-                reason: format!(
-                    "declared read scope {:?} exceeds the configured grant",
-                    m.reads
-                ),
-            }];
+        // Self-guard via the shared eligibility check (has_provider = true: this
+        // function is only reached with a provider). `dispatch` already runs the
+        // same check before screening, so this never fires from there; it keeps
+        // the loop correct if called another way.
+        if let Some(reason) = agent_skip_reason(m, self.read_tier, true) {
+            return vec![DispatchOutcome::Skipped { behaviour, reason }];
         }
-        // An agent manifest is required to declare a budget (enforced at
-        // load); refuse to run one without bounds rather than loop freely.
-        let Some(budget) = m.budget.as_ref() else {
-            return vec![DispatchOutcome::Skipped {
-                behaviour,
-                reason: "agent behaviour declares no budget".to_string(),
-            }];
-        };
+        // Guaranteed present by the eligibility check above.
+        let budget = m
+            .budget
+            .as_ref()
+            .expect("agent_skip_reason ensures a budget is declared");
 
         // The behaviour-scoped graph the gate's predict-before-act reads
         // through (a denying handle for a `reads: minimal` behaviour), so the
@@ -840,6 +1039,33 @@ impl<'a> Dispatcher<'a> {
 /// whether a behaviour is runnable or needs a provider wired.
 pub fn reads_satisfied(needs: ReadScope, granted: AccessTier) -> bool {
     needs == ReadScope::Minimal || granted == AccessTier::Full || needs.tier() == granted
+}
+
+/// Why a `kind: agent` behaviour cannot reach the model on this dispatch, if
+/// any. The single source of truth for agent eligibility: no provider (a bus
+/// outage), a declared read scope the configured tier does not grant, or a
+/// missing budget. `dispatch` calls it before screening so the classifier never
+/// runs for an event that cannot reach the model, and `run_agent_loop` calls it
+/// as its own guard, so the two never disagree. `None` means the behaviour is
+/// eligible to run (provider present, read-scope satisfied, budget declared).
+fn agent_skip_reason(
+    m: &crate::behaviour::BehaviourManifest,
+    read_tier: AccessTier,
+    has_provider: bool,
+) -> Option<String> {
+    if !has_provider {
+        return Some("no AI provider configured; agent behaviours cannot run".to_string());
+    }
+    if !reads_satisfied(m.reads, read_tier) {
+        return Some(format!(
+            "declared read scope {:?} exceeds the configured grant",
+            m.reads
+        ));
+    }
+    if m.budget.is_none() {
+        return Some("agent behaviour declares no budget".to_string());
+    }
+    None
 }
 
 /// Tokens to charge for one side of a completion. A coarse length-based
@@ -1660,6 +1886,354 @@ trigger:
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0].call_chain_id.as_deref(), Some("e1:demo-agent:step-0"));
         assert_eq!(recorded[1].call_chain_id.as_deref(), Some("e1:demo-agent:step-1"));
+    }
+
+    // --- S17 injection screening of external content ---
+
+    use lunaris_ai_classifier::{ClassifierError, InjectionScore};
+
+    /// A classifier that returns a fixed injection probability for any input.
+    struct FixedClassifier(f32);
+    impl InjectionClassifier for FixedClassifier {
+        fn score(&self, _text: &str) -> Result<InjectionScore, ClassifierError> {
+            Ok(InjectionScore::new(self.0))
+        }
+    }
+
+    /// A classifier that always errors, to check `screen` fails closed (Block).
+    struct FailingClassifier;
+    impl InjectionClassifier for FailingClassifier {
+        fn score(&self, _text: &str) -> Result<InjectionScore, ClassifierError> {
+            Err(ClassifierError::Unavailable("test".to_string()))
+        }
+    }
+
+    /// A classifier that panics, to check the blocking-task join error fails
+    /// closed (the same arm a scoring timeout takes).
+    struct PanickingClassifier;
+    impl InjectionClassifier for PanickingClassifier {
+        fn score(&self, _text: &str) -> Result<InjectionScore, ClassifierError> {
+            panic!("classifier panic");
+        }
+    }
+
+    fn external_event(path: &str) -> AgentEvent {
+        AgentEvent {
+            external_content: true,
+            ..event(path)
+        }
+    }
+
+    #[tokio::test]
+    async fn external_content_scored_as_injection_blocks_the_agent_loop() {
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        // The provider would step the loop if reached; it must not be.
+        let provider = MockProvider::new(vec![propose("graph.write"), stop()]);
+        let blocking: Arc<dyn InjectionClassifier> = Arc::new(FixedClassifier(0.99));
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        )
+        .with_screening(Arc::clone(&blocking), ClassifierPolicy::default());
+
+        let outcomes = d.dispatch(&external_event("~/evil.rs")).await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], DispatchOutcome::Blocked { .. }));
+        // The model was never called, so no step was gated or audited.
+        assert_eq!(audit.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn benign_external_content_runs_the_loop() {
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![propose("graph.write"), stop()]);
+        let benign: Arc<dyn InjectionClassifier> = Arc::new(FixedClassifier(0.01));
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        )
+        .with_screening(Arc::clone(&benign), ClassifierPolicy::default());
+
+        let outcomes = d.dispatch(&external_event("~/notes.rs")).await;
+        // Allowed content runs the loop (a decided step then a terminal stop).
+        assert!(outcomes.iter().any(|o| matches!(o, DispatchOutcome::Decided { .. })));
+        assert!(!outcomes.iter().any(|o| matches!(o, DispatchOutcome::Blocked { .. })));
+    }
+
+    #[tokio::test]
+    async fn warn_scored_external_content_passes_to_the_model() {
+        // A score between warn_at (0.5) and block_at (0.9) is Warn: per the
+        // classifier policy it is suspicious but passes (the signal is logged,
+        // and any resulting action is gated to confirmation). It must not block.
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![propose("graph.write"), stop()]);
+        let warn: Arc<dyn InjectionClassifier> = Arc::new(FixedClassifier(0.7));
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        )
+        .with_screening(warn, ClassifierPolicy::default());
+
+        let outcomes = d.dispatch(&external_event("~/notes.rs")).await;
+        assert!(outcomes.iter().any(|o| matches!(o, DispatchOutcome::Decided { .. })));
+        assert!(!outcomes.iter().any(|o| matches!(o, DispatchOutcome::Blocked { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_failing_classifier_blocks_external_content_fail_closed() {
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![propose("graph.write"), stop()]);
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        )
+        .with_screening(Arc::new(FailingClassifier), ClassifierPolicy::default());
+
+        let outcomes = d.dispatch(&external_event("~/x.rs")).await;
+        assert!(matches!(outcomes[0], DispatchOutcome::Blocked { .. }));
+        assert_eq!(audit.count().await, 0);
+    }
+
+    /// A classifier that records how many times it is asked to score, to prove
+    /// screening does not run for events that cannot reach the model.
+    struct CountingClassifier {
+        calls: std::sync::atomic::AtomicUsize,
+        score: f32,
+    }
+    impl InjectionClassifier for CountingClassifier {
+        fn score(&self, _text: &str) -> Result<InjectionScore, ClassifierError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(InjectionScore::new(self.score))
+        }
+    }
+
+    #[tokio::test]
+    async fn screening_does_not_run_when_no_provider_is_available() {
+        // Provider outage: an external agent event is Skipped (no provider)
+        // *before* screening, so the classifier is never consulted (a degraded
+        // provider must not become a per-event classifier CPU cost).
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let counting = Arc::new(CountingClassifier {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            score: 0.99, // would Block if ever consulted
+        });
+        let handle: Arc<dyn InjectionClassifier> = counting.clone();
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            None, // no provider
+            &TEST_CLOCK,
+        )
+        .with_screening(handle, ClassifierPolicy::default());
+
+        let outcomes = d.dispatch(&external_event("~/x.rs")).await;
+        // Skipped (no provider), not Blocked: screening was gated behind the
+        // eligibility preflight.
+        assert!(matches!(outcomes[0], DispatchOutcome::Skipped { .. }));
+        assert_eq!(counting.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fail_closed_mode_blocks_external_content_without_a_classifier() {
+        // A configured-but-unavailable classifier (FailClosed): external-content
+        // agent loops are blocked rather than silently unscreened.
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![propose("graph.write"), stop()]);
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        )
+        .with_screening_mode(ScreeningMode::FailClosed);
+
+        // External content is blocked...
+        let outcomes = d.dispatch(&external_event("~/x.rs")).await;
+        assert!(matches!(outcomes[0], DispatchOutcome::Blocked { .. }));
+        // ...but non-external content still runs (fail-closed gates external only).
+        let outcomes = d.dispatch(&event("~/foo.rs")).await;
+        assert!(outcomes.iter().any(|o| matches!(o, DispatchOutcome::Decided { .. })));
+    }
+
+    #[tokio::test]
+    async fn oversized_external_content_is_blocked_without_running_the_classifier() {
+        // A benign-scoring classifier would Allow, but an external payload past
+        // the screen cap is blocked fail-closed (bounding inference work).
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![propose("graph.write"), stop()]);
+        let benign: Arc<dyn InjectionClassifier> = Arc::new(FixedClassifier(0.0));
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        )
+        .with_screening(Arc::clone(&benign), ClassifierPolicy::default());
+
+        let huge = "a".repeat(MAX_SCREEN_BYTES + 1);
+        let outcomes = d.dispatch(&external_event(&huge)).await;
+        assert!(matches!(outcomes[0], DispatchOutcome::Blocked { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_held_scorer_permit_blocks_further_external_content_without_a_new_scorer() {
+        // A shared, process-lived gate with its single permit already held (a
+        // scorer wedged in a prior dispatcher epoch). A dispatcher built with the
+        // same gate must fail closed (Block) on external content, with a benign
+        // classifier that would otherwise Allow, and without consulting it (no
+        // second blocking scorer spawned). This is the across-rebuild bound.
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![propose("graph.write"), stop()]);
+
+        let screen_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = Arc::clone(&screen_gate).try_acquire_owned().unwrap(); // wedged scorer
+        let counting = Arc::new(CountingClassifier {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            score: 0.0, // would Allow if ever consulted
+        });
+        let handle: Arc<dyn InjectionClassifier> = counting.clone();
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        )
+        .with_screening(handle, ClassifierPolicy::default())
+        .with_screen_gate(Arc::clone(&screen_gate));
+
+        let outcomes = d.dispatch(&external_event("~/x.rs")).await;
+        assert!(matches!(outcomes[0], DispatchOutcome::Blocked { .. }));
+        // The classifier was never consulted: the gate blocked before scoring.
+        assert_eq!(counting.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_classifier_blocks_external_content_fail_closed() {
+        // A panic in the blocking scoring task surfaces as a join error, which
+        // takes the same fail-closed arm as a scoring timeout: block.
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![propose("graph.write"), stop()]);
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        )
+        .with_screening(Arc::new(PanickingClassifier), ClassifierPolicy::default());
+
+        let outcomes = d.dispatch(&external_event("~/x.rs")).await;
+        assert!(matches!(outcomes[0], DispatchOutcome::Blocked { .. }));
+        assert_eq!(audit.count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn non_external_content_is_not_screened() {
+        // A blocking classifier must not touch content that is not external:
+        // internal/graph-originated triggers are not subject to the injection
+        // screen.
+        let behaviours = [loaded(&agent_skill(5, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![propose("graph.write"), stop()]);
+        let blocking: Arc<dyn InjectionClassifier> = Arc::new(FixedClassifier(0.99));
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        )
+        .with_screening(Arc::clone(&blocking), ClassifierPolicy::default());
+
+        // event() is non-external; the loop runs despite the blocking classifier.
+        let outcomes = d.dispatch(&event("~/foo.rs")).await;
+        assert!(outcomes.iter().any(|o| matches!(o, DispatchOutcome::Decided { .. })));
+        assert!(!outcomes.iter().any(|o| matches!(o, DispatchOutcome::Blocked { .. })));
     }
 
     #[tokio::test]

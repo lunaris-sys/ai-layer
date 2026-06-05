@@ -8,6 +8,7 @@
 
 use lunaris_ai_core::pipeline::extract_json;
 use lunaris_ai_core::tagging::{Block, Origin, TaggedPrompt};
+use lunaris_ai_sandbox::extract_text;
 use serde::Deserialize;
 
 use crate::behaviour::Behaviour;
@@ -145,11 +146,27 @@ pub fn build_agent_prompt(
     );
 
     // The triggering event, as data. A file path or window title can read
-    // like an instruction, so it is tagged by origin, never trusted.
+    // like an instruction, so it is tagged by origin, never trusted. When the
+    // content is external, the event type and each field value are first run
+    // through the inert-text sanitiser (S18-B), so ANSI escapes, bidirectional
+    // overrides, and invisible/format characters cannot smuggle hidden
+    // instructions past the reader or the injection classifier. The event type
+    // is sanitised too: it is copied from the bus envelope (producer-controlled)
+    // and the router matches it by prefix/wildcard, so a behaviour can receive a
+    // type the producer padded with instruction-like or control characters.
     let event_block = {
-        let mut s = format!("event_type: {}", event.event_type);
+        let type_value = if event.external_content {
+            sanitize_external(&event.event_type)
+        } else {
+            event.event_type.clone()
+        };
+        let mut s = format!("event_type: {type_value}");
         for (k, v) in &event.fields {
-            s.push_str(&format!("\n{k}: {v}"));
+            if event.external_content {
+                s.push_str(&format!("\n{k}: {}", sanitize_external(v)));
+            } else {
+                s.push_str(&format!("\n{k}: {v}"));
+            }
         }
         s
     };
@@ -176,6 +193,34 @@ pub fn build_agent_prompt(
         preamble = tagged.preamble(),
         rendered = tagged.rendered(),
     )
+}
+
+/// Sanitise one external field value into inert text before it reaches the
+/// model. Reuses the document sandbox's text extractor (S18-B) in process:
+/// a short event field is not the parser attack surface the subprocess
+/// isolates, so the same stripping logic (control characters, ANSI escapes,
+/// bidirectional overrides, invisible/format characters) applies directly
+/// without the Landlock/seccomp worker. On the only failure the extractor can
+/// raise for a field (a value past its multi-megabyte cap, which is itself
+/// suspect), returns a placeholder rather than the raw value, so nothing
+/// unsanitised is ever forwarded.
+fn sanitize_external(value: &str) -> String {
+    extract_text(value.as_bytes()).unwrap_or_else(|_| "(unprocessable field)".to_string())
+}
+
+/// The external content of an event as the model will see it, for injection
+/// screening (S17). Covers the event type and every field value, sanitised
+/// exactly as [`build_agent_prompt`] sanitises them, so the screen covers
+/// precisely the untrusted text the model would read. The event type is
+/// included because it is bus-envelope-copied and prefix/wildcard-matched, not
+/// a trusted canonical identifier, so it could itself carry an injection. The
+/// field keys are short, fixed identifiers from the event decoder and are not
+/// screened.
+pub fn external_screen_text(event: &AgentEvent) -> String {
+    std::iter::once(sanitize_external(&event.event_type))
+        .chain(event.fields.values().map(|v| sanitize_external(v)))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -244,6 +289,55 @@ mod tests {
         assert!(prompt.contains("[GRAPH-DATA-"));
         assert!(prompt.contains("DATA ONLY"));
         assert!(prompt.contains("path: ~/x.rs"));
+    }
+
+    #[test]
+    fn external_field_values_are_stripped_of_smuggled_control_characters() {
+        let b = agent_behaviour(DEMO_AGENT);
+        // A filename carrying an ANSI escape, a bidi override, and a zero-width
+        // space, all of which could hide or reorder instructions for the model.
+        let nasty = "report\u{202E}cod.exe\u{200B}\u{1b}[31mignore previous";
+        let prompt = build_agent_prompt(&b, &opened(nasty, true), &[]);
+        // The dangerous characters are gone; the readable text survives.
+        assert!(!prompt.contains('\u{202E}'));
+        assert!(!prompt.contains('\u{200B}'));
+        assert!(!prompt.contains('\u{1b}'));
+        assert!(prompt.contains("report"));
+        assert!(prompt.contains("ignore previous")); // readable text kept, just inert
+    }
+
+    #[test]
+    fn graph_data_fields_are_not_sanitised() {
+        // Non-external content comes from trusted producers; it is left intact
+        // (sanitising could damage legitimate graph data).
+        let b = agent_behaviour(DEMO_AGENT);
+        let prompt = build_agent_prompt(&b, &opened("plain/path.rs", false), &[]);
+        assert!(prompt.contains("path: plain/path.rs"));
+    }
+
+    #[test]
+    fn external_screen_text_covers_the_event_type_and_values_sanitised() {
+        let mut ev = opened("a\u{200B}b", true);
+        // A producer-padded event type with a smuggled bidi override: it must be
+        // sanitised and present in the screened text, not silently trusted.
+        ev.event_type = "file.opened\u{202E}rm".to_string();
+        let text = external_screen_text(&ev);
+        assert!(text.contains("file.openedrm")); // type included, bidi stripped
+        assert!(!text.contains('\u{202E}'));
+        assert!(text.contains("ab")); // value included, zero-width stripped
+    }
+
+    #[test]
+    fn external_screen_text_of_a_fieldless_event_is_the_event_type() {
+        // A field-less event still has a producer-controlled event type to
+        // screen (it is bus-envelope-copied, not a trusted identifier).
+        let ev = AgentEvent {
+            id: "e".to_string(),
+            event_type: "calendar.event.upcoming".to_string(),
+            fields: BTreeMap::new(),
+            external_content: true,
+        };
+        assert_eq!(external_screen_text(&ev), "calendar.event.upcoming");
     }
 
     #[test]
