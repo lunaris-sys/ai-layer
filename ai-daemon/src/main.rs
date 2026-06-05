@@ -96,7 +96,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = config_watch::load_ai_settings();
     tracing::info!(
         enabled = settings.enabled,
-        provider = %settings.provider,
+        provider = %settings.provider.name,
+        model = %settings.provider.model,
         "loaded ai.toml"
     );
 
@@ -108,14 +109,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection = zbus::Connection::session().await?;
 
     // Foundation §8.4.6: outbound LLM traffic goes through ai-proxy.
+    // The provider config comes from `ai.toml` (name via `ai.provider`,
+    // model/window/token via the optional `[provider]` section), so a
+    // deployment points the daemon at any catalogued backend without a
+    // rebuild. Read once at startup: changing the provider needs a restart.
     let provider: Arc<dyn AIProvider> = Arc::new(
         ProxiedProvider::with_connection(
             ProxiedConfig {
-                name: settings.provider.clone(),
-                model: "llama3:8b".to_string(),
-                audit_token: "ai-daemon-default-token".to_string(),
-                // llama3:8b ships an 8192-token context window.
-                context_window: 8_192,
+                name: settings.provider.name.clone(),
+                model: settings.provider.model.clone(),
+                audit_token: settings.provider.audit_token.clone(),
+                context_window: settings.provider.context_window,
             },
             &connection,
         )

@@ -37,3 +37,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 # MockAuditSink for the dispatch/audit tests; gated out of production
 # by audit-proto's `test-util` feature.
 audit-proto = { path = "../../audit-proto", features = ["test-util"] }
+# Temp `ai.toml` files for the config-parsing tests.
+tempfile = "3"
