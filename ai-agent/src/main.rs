@@ -866,13 +866,28 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
             action,
             decision,
             audit_index,
-        } => tracing::info!(
-            behaviour = %behaviour,
-            summary = %action.summary,
-            ?decision,
-            audit_index = *audit_index,
-            "behaviour decision gated and audited"
-        ),
+            plan,
+        } => {
+            tracing::info!(
+                behaviour = %behaviour,
+                summary = %action.summary,
+                ?decision,
+                audit_index = *audit_index,
+                "behaviour decision gated and audited"
+            );
+            // The concrete effect and how to undo it, so the decision's plan is
+            // visible. Content-free: schema bind-name effects (e.g.
+            // AssertEdge file-FILE_PART_OF-project), never the operands. `None`
+            // for an unregistered tool.
+            if let Some(plan) = plan {
+                tracing::info!(
+                    behaviour = %behaviour,
+                    effects = ?plan.effects,
+                    undo = ?plan.compensation,
+                    "decision execution plan"
+                );
+            }
+        }
         DispatchOutcome::Refused { behaviour, reason } => {
             tracing::warn!(behaviour = %behaviour, reason = %reason, "behaviour action refused")
         }

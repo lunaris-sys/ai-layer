@@ -20,6 +20,43 @@
 
 use crate::world::{compensation_of, ActionSchema, Effect, Predicate, Provenance};
 
+/// What a decided action would do and how to undo it, surfaced so the agent's
+/// audited proposals are visible (logged today; the activity view and executor
+/// later). The effects and their compensation are in the schema's bind-name
+/// vocabulary, not resolved ids, so they are content-free (the operands live in
+/// the action's arguments). `compensation` is `None` for an irreversible action
+/// (no derivable inverse).
+///
+/// Deliberately no idempotency / dedup key here: an executor's at-least-once
+/// dedup key needs decision identity (a crash replay of one decision matches,
+/// but a genuinely new decision with the same operands does not) and a
+/// collision-resistant, version-stable digest over a canonical encoding. Those
+/// are executor-design decisions that have to be made against the real durable
+/// replay path, so the key is built with the executor, not minted speculatively
+/// on this public contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionPlan {
+    /// The effects the action would apply.
+    pub effects: Vec<Effect>,
+    /// The compensation that undoes them, or `None` if irreversible.
+    pub compensation: Option<Vec<Effect>>,
+}
+
+/// Build the [`ExecutionPlan`] for an invoked action: its registry-resolved
+/// effects and their compensation (if reversible). `None` for an unregistered
+/// action (the gate cannot prove or plan one). Depends only on the action id:
+/// the plan describes what the action's schema does, independent of the
+/// operands.
+pub(crate) fn plan_for(tool: &str) -> Option<ExecutionPlan> {
+    let trusted = lookup(tool)?;
+    let effects = trusted.schema().effects.clone();
+    let compensation = compensation_of(&effects);
+    Some(ExecutionPlan {
+        effects,
+        compensation,
+    })
+}
+
 /// An [`ActionSchema`] the registry vouches for. Its single field is private
 /// and it has no public constructor, so it can only be produced by [`lookup`]
 /// in this module, never forged from untrusted input elsewhere in the crate.
@@ -133,6 +170,30 @@ mod tests {
     fn an_unknown_action_has_no_rule() {
         assert!(lookup("fs.delete").is_none());
         assert!(lookup("").is_none());
+    }
+
+    #[test]
+    fn plan_for_carries_effects_and_compensation() {
+        let plan = plan_for("graph.write").expect("graph.write is registered");
+        assert_eq!(
+            plan.effects,
+            vec![Effect::AssertEdge {
+                from: "file".to_string(),
+                edge: "FILE_PART_OF".to_string(),
+                to: "project".to_string(),
+            }]
+        );
+        // Reversible: the compensation retracts what the effect asserts.
+        assert_eq!(
+            plan.compensation,
+            Some(vec![Effect::RetractEdge {
+                from: "file".to_string(),
+                edge: "FILE_PART_OF".to_string(),
+                to: "project".to_string(),
+            }])
+        );
+        // An unregistered action has no plan.
+        assert!(plan_for("fs.delete").is_none());
     }
 
     #[test]
