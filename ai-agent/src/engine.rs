@@ -29,7 +29,7 @@ use crate::agentic::{build_agent_prompt, external_screen_text, parse_agent_step,
 use lunaris_ai_classifier::{screen, ClassifierPolicy, InjectionClassifier, Verdict};
 use crate::behaviour::{Behaviour, BehaviourKind, ReadScope};
 use crate::compaction::{self, CompactionPolicy, TranscriptEntry};
-use crate::gate::{ActionContext, Gate, GateError, ProposedAction};
+use crate::gate::{ActionContext, DecisionReason, Gate, GateError, ProposedAction};
 use crate::loader::LoadedBehaviour;
 use crate::registry::plan_for;
 /// Re-exported so the public [`DispatchOutcome::Decided`] can carry a plan while
@@ -125,12 +125,13 @@ pub enum DispatchOutcome {
         action: ProposedAction,
         /// The gate's decision.
         decision: ActionDecision,
+        /// The faithful reason for that decision (D2), from the gate's logic.
+        reason: DecisionReason,
         /// The audit ledger index of the recorded decision.
         audit_index: u64,
-        /// What the action would do and how to undo it (B1 compensation + an
-        /// idempotency key), for a registered action; `None` for an
-        /// unregistered tool. Surfaced so the decision's concrete effect and
-        /// its undo are visible (logged today).
+        /// What the action would do and how to undo it (B1 compensation), for a
+        /// registered action; `None` for an unregistered tool. Surfaced so the
+        /// decision's concrete effect and its undo are visible (logged today).
         plan: Option<ExecutionPlan>,
     },
     /// The handler reached a terminal condition with no action.
@@ -720,6 +721,7 @@ impl<'a> Dispatcher<'a> {
                             behaviour,
                             action,
                             decision: receipt.decision,
+                            reason: receipt.reason,
                             audit_index: receipt.audit_index,
                             plan,
                         }
@@ -994,6 +996,7 @@ impl<'a> Dispatcher<'a> {
                                 behaviour: behaviour.clone(),
                                 action,
                                 decision: receipt.decision,
+                                reason: receipt.reason,
                                 audit_index: receipt.audit_index,
                                 plan,
                             });
@@ -1522,6 +1525,7 @@ tools:
                     arguments: Default::default(),
                 },
                 decision: ActionDecision::Propose,
+                reason: DecisionReason::Mode,
                 audit_index: 0,
                 plan: plan_for("graph.write"),
             }
@@ -1651,6 +1655,7 @@ tools:
                     arguments: Default::default(),
                 },
                 decision: ActionDecision::RequireConfirmation,
+                reason: DecisionReason::ExternalTrigger,
                 audit_index: 0,
                 plan: plan_for("graph.write"),
             }

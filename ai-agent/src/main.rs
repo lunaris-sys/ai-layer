@@ -865,6 +865,7 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
             behaviour,
             action,
             decision,
+            reason,
             audit_index,
             plan,
         } => {
@@ -872,6 +873,7 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
                 behaviour = %behaviour,
                 summary = %action.summary,
                 ?decision,
+                ?reason,
                 audit_index = *audit_index,
                 "behaviour decision gated and audited"
             );
