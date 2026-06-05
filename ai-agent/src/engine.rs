@@ -17,8 +17,8 @@
 //! coalescing (gap G1); and the `main.rs` daemon wiring. Each is a
 //! follow-up that slots behind these same seams.
 
-use std::collections::BTreeMap;
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, SystemTime};
 
 use futures::FutureExt as _;
 use lunaris_ai_core::capability::{AccessTier, ActionDecision};
@@ -42,6 +42,22 @@ const AGENT_APP_ID: &str = "org.lunaris.agent";
 /// or runs away is abandoned with a Failed outcome rather than stalling the
 /// loop. (Agent-loop budgets, which are per-step, arrive separately.)
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default per-behaviour coalescing window (gap G1). A burst of identical
+/// events for one behaviour within this window fires it once. Short by design:
+/// long enough to collapse a "x100 in a second" storm, short enough not to
+/// suppress a deliberate re-trigger seconds later. Tunable via
+/// [`Dispatcher::with_coalesce_window`]; per-behaviour tuning from the manifest
+/// is a follow-up.
+const DEFAULT_COALESCE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Hard cap on the coalescer's tracking map (gap G1), so a storm of distinct
+/// events (many unique paths within one window, e.g. a build or a `find`)
+/// cannot grow it without bound. At the cap, stale entries are pruned; if it is
+/// still full of fresh distinct events, the map is cleared (coalescing forgets
+/// recent entries, never dropping a distinct dispatch). Comparable to the
+/// kernel-layer normaliser's dedup-map cleanup threshold.
+const MAX_COALESCE_ENTRIES: usize = 4096;
 
 /// What a workflow handler decides for a matched event.
 #[derive(Debug, Clone)]
@@ -121,6 +137,128 @@ pub enum DispatchOutcome {
         /// Why it was skipped.
         reason: String,
     },
+    /// The behaviour matched but its dispatch was coalesced into a recent
+    /// identical one (gap G1 burst dedup), so it did not run again this window.
+    Coalesced {
+        /// The behaviour whose dispatch was coalesced.
+        behaviour: String,
+    },
+}
+
+/// Per-behaviour burst coalescing (gap G1). Suppresses a repeat dispatch of a
+/// behaviour for an identical event within a short window, so a burst (e.g.
+/// `file.opened` x100 for one path in a second) fires the behaviour once, not
+/// once per event. Distinct from S15 (the knowledge daemon's per-identity query
+/// rate limiter): this is the agent's own dispatch dedup, keyed on (behaviour,
+/// event), and it drops the duplicate dispatch rather than throttling a caller.
+///
+/// A dispatch is keyed by a fixed-size digest of (behaviour, event type, decoded
+/// fields, external-content origin), hashed with a per-process random seed. The
+/// digest keeps the map's per-entry memory bounded regardless of how large a
+/// producer-controlled field is (a long `path` cannot bloat it) and still
+/// coalesces such events rather than letting them bypass the dedup; the random
+/// seed makes a crafted colliding key (to drop a distinct event) infeasible,
+/// and a chance collision at the map's bounded size is astronomically unlikely
+/// and would at worst suppress one suggestion. The external-content origin is
+/// part of the key because a local and an external event with otherwise-
+/// identical fields are not the same dispatch (the gate forces confirmation for
+/// an external trigger and audits it on its own), so they must not coalesce.
+struct Coalescer {
+    window: Duration,
+    /// Per-process random seed for the key digest, so a producer cannot craft a
+    /// colliding key without knowing it.
+    hasher: std::collections::hash_map::RandomState,
+    /// Key digest to the time that (behaviour, event) was last admitted.
+    seen: HashMap<u64, SystemTime>,
+}
+
+impl Coalescer {
+    fn new(window: Duration) -> Self {
+        Self {
+            window,
+            hasher: std::collections::hash_map::RandomState::new(),
+            seen: HashMap::new(),
+        }
+    }
+
+    /// The fixed-size digest a dispatch is coalesced on.
+    fn digest(
+        &self,
+        behaviour: &str,
+        event_type: &str,
+        fields: &BTreeMap<String, String>,
+        external_content: bool,
+    ) -> u64 {
+        use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
+        let mut h = self.hasher.build_hasher();
+        behaviour.hash(&mut h);
+        event_type.hash(&mut h);
+        // A BTreeMap hashes in sorted key order, so the same fields always
+        // digest identically.
+        fields.hash(&mut h);
+        external_content.hash(&mut h);
+        h.finish()
+    }
+
+    /// Decide whether to dispatch the keyed event at `now`, recording the time
+    /// when it admits. Returns `true` (dispatch) when the key is new or its last
+    /// dispatch is older than the window; `false` (coalesce) when a dispatch
+    /// happened within the window. The window is measured from the first
+    /// dispatch of a burst, not extended by each coalesced duplicate, so a
+    /// sustained stream fires once per window rather than being suppressed
+    /// forever.
+    fn admit(
+        &mut self,
+        behaviour: &str,
+        event_type: &str,
+        fields: &BTreeMap<String, String>,
+        external_content: bool,
+        now: SystemTime,
+    ) -> bool {
+        let key = self.digest(behaviour, event_type, fields, external_content);
+        let window = self.window;
+        // Bound cost and memory. The common case (a small map) does no scan:
+        // expiry is lazy, per key, on access below. Only when the map has grown
+        // to the cap do we prune stale entries in one pass; if a genuine storm
+        // of distinct, still-fresh events keeps it at the cap, clear it
+        // entirely. Clearing only forgets recent entries, so at worst a few
+        // duplicates slip through afterwards (over-dispatch, never a dropped
+        // distinct event), while per-event cost stays amortised O(1) and the
+        // map stays bounded under a noisy or hostile producer.
+        if self.seen.len() >= MAX_COALESCE_ENTRIES {
+            self.seen.retain(|_, last| {
+                now.duration_since(*last)
+                    .map(|elapsed| elapsed < window)
+                    .unwrap_or(false)
+            });
+            if self.seen.len() >= MAX_COALESCE_ENTRIES {
+                self.seen.clear();
+            }
+        }
+        match self.seen.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                // Within the window: coalesce, without refreshing (the window is
+                // measured from the first dispatch of a burst, not extended by
+                // each duplicate). Expired, or future-stamped after a backwards
+                // clock move: treat as stale, refresh to `now` and admit, rather
+                // than suppressing the event past the window.
+                let within = now
+                    .duration_since(*slot.get())
+                    .map(|elapsed| elapsed < window)
+                    .unwrap_or(false);
+                if within {
+                    false
+                } else {
+                    slot.insert(now);
+                    true
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(now);
+                true
+            }
+        }
+    }
 }
 
 /// The dispatch engine over a set of loaded behaviours, their handlers, the
@@ -147,6 +285,12 @@ pub struct Dispatcher<'a> {
     /// (and the provider, once wired) can override it via
     /// [`Dispatcher::with_compaction`].
     compaction: CompactionPolicy,
+    /// Per-behaviour burst coalescing (gap G1). Behind a mutex because
+    /// `dispatch` takes `&self` yet must record each admitted dispatch; the
+    /// lock is held only for the synchronous admit decision, never across an
+    /// await. Reset when the dispatcher is rebuilt (a config reload or provider
+    /// recovery), which is acceptable for a burst-dedup optimisation.
+    coalescer: std::sync::Mutex<Coalescer>,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -170,6 +314,7 @@ impl<'a> Dispatcher<'a> {
             provider,
             clock,
             compaction: CompactionPolicy::default(),
+            coalescer: std::sync::Mutex::new(Coalescer::new(DEFAULT_COALESCE_WINDOW)),
         }
     }
 
@@ -180,20 +325,78 @@ impl<'a> Dispatcher<'a> {
         self
     }
 
+    /// Override the per-behaviour coalescing window (gap G1). Mainly for tests,
+    /// which pair it with a manual clock to exercise the window deterministically.
+    pub fn with_coalesce_window(mut self, window: Duration) -> Self {
+        self.coalescer = std::sync::Mutex::new(Coalescer::new(window));
+        self
+    }
+
     /// Dispatch one event: route it to every enabled matching behaviour and
     /// run each, returning the outcomes. A workflow behaviour yields one
     /// outcome; a `kind: agent` behaviour yields one per loop step plus a
     /// terminal.
     pub async fn dispatch(&self, event: &AgentEvent) -> Vec<DispatchOutcome> {
         let mut outcomes = Vec::new();
+        // A trusted, consumer-side timestamp for coalescing: the dispatcher's
+        // wall clock, taken once per event for all behaviours it matches.
+        let now = self.clock.now();
         for lb in matching_behaviours(&event.event_type, &event.fields, self.behaviours) {
+            let name = lb.behaviour.manifest.name.clone();
+            // G1: coalesce a burst of identical events for this behaviour, so a
+            // storm of one event fires it once per window, not once per event.
+            // The window is measured on the dispatcher's wall clock (a trusted,
+            // consumer-side time), NOT the bus envelope timestamp: producers do
+            // not agree on that field's unit or epoch (the kernel layer sends
+            // monotonic ns-since-boot, the compositor Unix micros) and it is
+            // producer-controlled (spoofable), so it is neither comparable
+            // across sources nor trustworthy for a window. The trade-off: the
+            // daemon awaits each dispatch before receiving the next event, so an
+            // identical burst queued behind a slow handler (a multi-step agent
+            // loop) is processed more than a window apart and is not coalesced.
+            // This degrades to no-dedup, which is safe (over-dispatch, never a
+            // wrong drop), and the realistic coalesced case avoids it (fast
+            // workflow handlers on high-frequency events; agent loops trigger on
+            // field-less calendar/schedule events, which are not coalesced). A
+            // backlog-proof form needs a trusted ingestion timestamp stamped
+            // before dispatch (in the SDK event consumer) or ingestion decoupled
+            // from dispatch, a deliberate follow-up. Coalesce only events with a
+            // stable identity (non-empty decoded fields): an event with no
+            // decoded fields carries no entity to key on, so distinct ones would
+            // collide and a real one could be dropped, so those always dispatch.
+            // The key is a bounded digest, so a large producer-controlled field
+            // neither bloats the map nor bypasses dedup. Lock only for the
+            // synchronous admit decision, released before any await below.
+            let admitted = if event.fields.is_empty() {
+                true
+            } else {
+                self.coalescer
+                    .lock()
+                    .expect("coalescer mutex poisoned")
+                    .admit(
+                        &name,
+                        &event.event_type,
+                        &event.fields,
+                        event.external_content,
+                        now,
+                    )
+            };
+            if !admitted {
+                outcomes.push(DispatchOutcome::Coalesced { behaviour: name });
+                continue;
+            }
             if lb.behaviour.manifest.kind == BehaviourKind::Agent {
                 match self.provider {
                     Some(provider) => {
-                        outcomes.extend(self.run_agent_loop(lb, event, provider).await)
+                        // Each agent loop gets its own wall-clock anchor, read
+                        // here immediately before it runs, so an earlier
+                        // behaviour's runtime never eats into this loop's budget.
+                        let start = self.clock.now();
+                        outcomes
+                            .extend(self.run_agent_loop(lb, event, provider, start).await)
                     }
                     None => outcomes.push(DispatchOutcome::Skipped {
-                        behaviour: lb.behaviour.manifest.name.clone(),
+                        behaviour: name,
                         reason: "no AI provider configured; agent behaviours cannot run"
                             .to_string(),
                     }),
@@ -340,6 +543,10 @@ impl<'a> Dispatcher<'a> {
         lb: &LoadedBehaviour,
         event: &AgentEvent,
         provider: &dyn AIProvider,
+        // This loop's wall-clock anchor, read by `dispatch` immediately before
+        // this call so the budget is per-behaviour (an earlier behaviour's
+        // runtime does not count against it).
+        start: SystemTime,
     ) -> Vec<DispatchOutcome> {
         let m = &lb.behaviour.manifest;
         let behaviour = m.name.clone();
@@ -375,7 +582,6 @@ impl<'a> Dispatcher<'a> {
         let mut outcomes = Vec::new();
         let mut transcript: Vec<TranscriptEntry> = Vec::new();
         let mut tokens_spent: u32 = 0;
-        let start = self.clock.now();
         // The model's input window, from the wired provider, so the
         // context-window guard tracks the real backend rather than a guess.
         let window = provider.context_window();
@@ -728,7 +934,7 @@ mod tests {
 
     use crate::behaviour::parse;
     use crate::loader::{DisableReason, LoadedBehaviour, Provenance, Status};
-    use crate::seams::{GraphError, NullObserver, SystemClock};
+    use crate::seams::{GraphError, ManualClock, NullObserver, SystemClock};
 
     /// A fixed clock for the workflow tests, which do not exercise the
     /// wall-clock budget (the agent-loop tests use an advancing clock).
@@ -749,6 +955,22 @@ tools:
 ---
 "#;
 
+    /// A workflow on an event type the source decodes to no fields, to check
+    /// that field-less events are never coalesced.
+    const CALENDAR: &str = r#"---
+name: meeting-prep-test
+description: A test behaviour on an event type that decodes to no fields.
+kind: workflow
+handler: auto_tag_by_project
+reads: minimal
+trigger:
+  type: event
+  event: calendar.event.upcoming
+tools:
+  graph.write: [Project, FILE_PART_OF]
+---
+"#;
+
     fn loaded(skill: &str, status: Status) -> LoadedBehaviour {
         LoadedBehaviour {
             behaviour: parse(skill).expect("valid fixture"),
@@ -763,6 +985,17 @@ tools:
             id: "e1".to_string(),
             event_type: "file.opened".to_string(),
             fields: [("path".to_string(), path.to_string())].into_iter().collect(),
+            external_content: false,
+        }
+    }
+
+    /// An event with no decoded payload fields (the shape the source produces
+    /// for an event type it does not yet decode, e.g. `calendar.event.upcoming`).
+    fn fieldless_event(event_type: &str) -> AgentEvent {
+        AgentEvent {
+            id: "c1".to_string(),
+            event_type: event_type.to_string(),
+            fields: BTreeMap::new(),
             external_content: false,
         }
     }
@@ -841,6 +1074,187 @@ tools:
         static FS: FsPathResolver = FsPathResolver;
         static MOUNTS: StaticMountPolicy = StaticMountPolicy::empty();
         Gate::new(cap, audit, obs, &FS, &MOUNTS)
+    }
+
+    fn fields_of(path: &str) -> BTreeMap<String, String> {
+        [("path".to_string(), path.to_string())].into_iter().collect()
+    }
+
+    #[test]
+    fn coalescer_admits_first_then_coalesces_within_window_then_readmits_after() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let mut c = Coalescer::new(Duration::from_secs(1));
+        let foo = fields_of("~/foo.rs");
+        // First sighting of (behaviour, event): admitted.
+        assert!(c.admit("b", "file.opened", &foo, false, t0));
+        // Same key within the window: coalesced.
+        assert!(!c.admit("b", "file.opened", &foo, false, t0 + Duration::from_millis(500)));
+        // A different behaviour, same event: independent, admitted.
+        assert!(c.admit("other", "file.opened", &foo, false, t0 + Duration::from_millis(500)));
+        // A different entity (path) for the same behaviour: not coalesced.
+        assert!(c.admit("b", "file.opened", &fields_of("~/bar.rs"), false, t0 + Duration::from_millis(600)));
+        // The window is measured from the first admit (t0), not extended by the
+        // coalesced duplicate, so once it elapses the same key admits again.
+        assert!(c.admit("b", "file.opened", &foo, false, t0 + Duration::from_millis(1001)));
+    }
+
+    #[test]
+    fn coalescer_window_is_measured_from_the_first_admit_not_each_duplicate() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let mut c = Coalescer::new(Duration::from_secs(1));
+        let foo = fields_of("~/foo.rs");
+        assert!(c.admit("b", "file.opened", &foo, false, t0));
+        // A duplicate near the end of the window does not push the window out.
+        assert!(!c.admit("b", "file.opened", &foo, false, t0 + Duration::from_millis(900)));
+        // Just past one window from the first admit: re-admitted, despite the
+        // recent duplicate.
+        assert!(c.admit("b", "file.opened", &foo, false, t0 + Duration::from_millis(1001)));
+    }
+
+    #[test]
+    fn coalescer_treats_a_backwards_clock_entry_as_stale_and_readmits() {
+        let t_high = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let t_low = SystemTime::UNIX_EPOCH + Duration::from_secs(100); // clock rolled back
+        let mut c = Coalescer::new(Duration::from_secs(1));
+        let foo = fields_of("~/foo.rs");
+        assert!(c.admit("b", "file.opened", &foo, false, t_high));
+        // After a rollback the prior entry is in the future relative to `now`.
+        // It must be treated as stale so the same event re-admits, rather than
+        // being suppressed until wall time catches back up to t_high.
+        assert!(c.admit("b", "file.opened", &foo, false, t_low));
+    }
+
+    #[test]
+    fn coalescer_map_stays_bounded_under_a_distinct_event_storm() {
+        // Many distinct events within one window are not coalesced (each is a
+        // new key), but the tracking map must not grow without bound.
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let mut c = Coalescer::new(Duration::from_secs(60)); // long window: nothing expires
+        for i in 0..(MAX_COALESCE_ENTRIES * 2) {
+            // Each distinct path is a new key, so every admit dispatches.
+            assert!(c.admit("b", "file.opened", &fields_of(&format!("~/f{i}.rs")), false, t0));
+        }
+        assert!(
+            c.seen.len() <= MAX_COALESCE_ENTRIES,
+            "coalescer map must stay bounded under a distinct-event storm: {}",
+            c.seen.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn events_with_no_decoded_fields_are_never_coalesced() {
+        // calendar.event.upcoming decodes to empty fields today, so two distinct
+        // upcoming meetings share a behaviour+type+fields key. They must both
+        // dispatch, never be coalesced into one (which would drop a real prep).
+        let behaviours = [loaded(CALENDAR, Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            None,
+            &TEST_CLOCK,
+        )
+        .with_coalesce_window(Duration::from_secs(1));
+
+        // Same occurrence time, identical (empty) fields: both must still dispatch.
+        let first = d.dispatch(&fieldless_event("calendar.event.upcoming")).await;
+        let second = d.dispatch(&fieldless_event("calendar.event.upcoming")).await;
+        assert!(matches!(first.as_slice(), [DispatchOutcome::Decided { .. }]));
+        assert!(
+            matches!(second.as_slice(), [DispatchOutcome::Decided { .. }]),
+            "an event with no decoded fields must not be coalesced: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_coalesces_a_burst_then_readmits_after_the_window() {
+        let behaviours = [loaded(AUTO_TAG, Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        // Coalescing keys on the dispatcher's wall clock; drive it with a manual
+        // clock. This is a workflow behaviour, so the loop clock is never read.
+        let clock = ManualClock::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1000));
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            None,
+            &clock,
+        )
+        .with_coalesce_window(Duration::from_secs(1));
+
+        // First identical event: dispatched.
+        let first = d.dispatch(&event("~/Repositories/foo.rs")).await;
+        assert!(matches!(first.as_slice(), [DispatchOutcome::Decided { .. }]));
+
+        // Same event again within the window (clock not advanced): coalesced,
+        // handler not re-run.
+        let second = d.dispatch(&event("~/Repositories/foo.rs")).await;
+        assert_eq!(
+            second,
+            vec![DispatchOutcome::Coalesced {
+                behaviour: "auto-tag-by-project".to_string()
+            }]
+        );
+
+        // A different file (different entity) is not coalesced.
+        let other = d.dispatch(&event("~/Repositories/bar.rs")).await;
+        assert!(matches!(other.as_slice(), [DispatchOutcome::Decided { .. }]));
+
+        // Once the window elapses, the same file admits again.
+        clock.advance(Duration::from_millis(1001));
+        let later = d.dispatch(&event("~/Repositories/foo.rs")).await;
+        assert!(matches!(later.as_slice(), [DispatchOutcome::Decided { .. }]));
+    }
+
+    #[tokio::test]
+    async fn a_long_path_event_is_coalesced_via_the_digest() {
+        // A field larger than any byte cap is still coalesced: the key is a
+        // fixed-size digest, so a long producer-controlled path neither bloats
+        // the map nor lets a duplicate storm bypass the dedup.
+        let behaviours = [loaded(AUTO_TAG, Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let clock = ManualClock::new(SystemTime::UNIX_EPOCH + Duration::from_secs(1000));
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            None,
+            &clock,
+        )
+        .with_coalesce_window(Duration::from_secs(1));
+
+        // A very long path, outside ~/.cache so the filter passes.
+        let big = format!("~/Repositories/{}", "x".repeat(4096));
+        let first = d.dispatch(&event(&big)).await;
+        // Identical event within the window: coalesced via the digest.
+        let second = d.dispatch(&event(&big)).await;
+        assert!(matches!(first.as_slice(), [DispatchOutcome::Decided { .. }]));
+        assert_eq!(
+            second,
+            vec![DispatchOutcome::Coalesced {
+                behaviour: "auto-tag-by-project".to_string()
+            }],
+            "a long-path event must still be coalesced via the digest: {second:?}"
+        );
     }
 
     #[tokio::test]
@@ -1558,7 +1972,10 @@ trigger:
         fn now(&self) -> std::time::SystemTime {
             let mut c = self.calls.lock().unwrap();
             *c += 1;
-            if *c == 1 {
+            // Call 1 is dispatch's coalescing clock read; call 2 is the loop's
+            // per-behaviour start anchor; call 3 (the in-loop elapsed check)
+            // jumps backwards to 50s, which the loop must treat as exhausted.
+            if *c <= 2 {
                 std::time::UNIX_EPOCH + Duration::from_secs(100)
             } else {
                 std::time::UNIX_EPOCH + Duration::from_secs(50)

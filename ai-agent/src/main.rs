@@ -644,6 +644,9 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
         DispatchOutcome::Skipped { behaviour, reason } => {
             tracing::debug!(behaviour = %behaviour, reason = %reason, "behaviour skipped")
         }
+        DispatchOutcome::Coalesced { behaviour } => {
+            tracing::debug!(behaviour = %behaviour, "behaviour dispatch coalesced (burst)")
+        }
     }
 }
 
