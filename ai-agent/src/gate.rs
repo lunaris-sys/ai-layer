@@ -166,23 +166,60 @@ pub struct ActionContext<'a> {
 /// free-text rationale (Foundation D2: the explanation must be the real causal
 /// chain, not a narrative the model could fabricate). Surfaced so a confirmation
 /// prompt or the activity view can say *why* an action needs the user.
+///
+/// Several causes can apply at once: a high-impact action triggered by external
+/// content confirms for both reasons, and losing the external-content
+/// provenance of a high-impact action would hide the prompt-injection path in
+/// incident reconstruction. So this records the full cause set (both overrides
+/// plus the base disposition), not a single winner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecisionReason {
-    /// The action's kind always requires confirmation (a high-impact class,
-    /// including a schema-derived [`ActionKind::Irreversible`]).
-    HighImpact(ActionKind),
-    /// The trigger carried external content, which always confirms regardless
-    /// of mode (prompt-injection containment).
-    ExternalTrigger,
-    /// An executing decision could not be proven safe (no rule, an unprovable
-    /// invocation, an irreversible effect, or a timed-out proof), so the
-    /// conservative cap (confirmation) stands.
-    Unproven,
+pub struct DecisionReason {
+    /// The action's high-impact class, if its kind always requires confirmation
+    /// (a hardcoded class or a schema-derived [`ActionKind::Irreversible`]).
+    pub high_impact: Option<ActionKind>,
+    /// The trigger carried external content, which always confirms regardless of
+    /// mode (prompt-injection containment) , the key incident-reconstruction fact.
+    pub external_trigger: bool,
+    /// The base disposition absent the two overrides above.
+    pub basis: DecisionBasis,
+}
+
+/// The base disposition of a decision, before the always-confirm overrides
+/// (external trigger, high-impact class) are applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionBasis {
+    /// The per-application action mode decided it (the suggest flow, where the
+    /// user executes the proposal manually).
+    Mode,
     /// A proven, reversible action was lifted to previewed execution.
     ProvenReversible,
-    /// No override applied; the per-application action mode decided it (the
-    /// suggest flow, where the user executes the proposal manually).
-    Mode,
+    /// An executing decision could not be proven safe (no rule, an unprovable
+    /// invocation, an irreversible effect, or a timed-out proof), so the
+    /// conservative cap (confirmation) stands. Only the cause when neither
+    /// override applied.
+    Unproven,
+    /// Confirmation was forced purely by an override (external/high-impact); the
+    /// base disposition is not itself the cause.
+    Overridden,
+}
+
+impl DecisionReason {
+    /// The plain suggest-mode flow (propose), no overrides.
+    pub fn mode() -> Self {
+        Self { high_impact: None, external_trigger: false, basis: DecisionBasis::Mode }
+    }
+    /// A proven, reversible lift to preview, no overrides.
+    pub fn proven_reversible() -> Self {
+        Self { high_impact: None, external_trigger: false, basis: DecisionBasis::ProvenReversible }
+    }
+    /// An external-trigger-only confirmation.
+    pub fn external() -> Self {
+        Self { high_impact: None, external_trigger: true, basis: DecisionBasis::Overridden }
+    }
+    /// A high-impact-class-only confirmation.
+    pub fn high_impact(kind: ActionKind) -> Self {
+        Self { high_impact: Some(kind), external_trigger: false, basis: DecisionBasis::Overridden }
+    }
 }
 
 /// The gate's verdict for one proposed action, plus the ledger index of
@@ -272,10 +309,18 @@ impl<'a> Gate<'a> {
         // (e.g. `fs.move: [~/Downloads]`) need structured action arguments
         // to verify and are enforced by the B2 world-model/executor layer.
         if !tools.contains_key(&action.tool) {
+            // Record the content-free causes (external trigger, high-impact class
+            // by tool name) on the refusal too, so a prompt-injection attempt to
+            // call an undeclared high-impact tool (delete_file, send_email) is
+            // reconstructable from the durable ledger, not flattened to a bare
+            // "out of scope". The tool is unregistered here, so reversibility is
+            // not derivable; name-based classification is what applies.
+            let outcome =
+                refusal_outcome(action_kind_for_tool(&action.tool), ctx.external_trigger);
             self.audit
                 .submit(behaviour_action_event(
                     behaviour_name,
-                    "refused-out-of-scope",
+                    outcome,
                     ctx.correlation_id,
                 ))
                 .await
@@ -365,25 +410,31 @@ impl<'a> Gate<'a> {
         };
 
         // The faithful reason for the final decision, read off the gate's own
-        // logic (never the model's rationale). A previewed execution is the
-        // proven-reversible lift; a propose is the plain suggest-mode flow; a
-        // confirmation is one of the overrides (high-impact class, external
-        // trigger) or an executing decision that could not be proven/lifted.
-        let reason = match decision {
-            ActionDecision::PreviewThenExecute => DecisionReason::ProvenReversible,
-            ActionDecision::Propose => DecisionReason::Mode,
-            ActionDecision::RequireConfirmation => {
-                if kind.always_requires_confirmation() {
-                    DecisionReason::HighImpact(kind)
-                } else if ctx.external_trigger {
-                    DecisionReason::ExternalTrigger
-                } else {
-                    DecisionReason::Unproven
-                }
-            }
+        // logic (never the model's rationale), recording ALL causes that apply.
+        // The base disposition: a previewed execution is the proven-reversible
+        // lift; a propose is the plain suggest flow; a confirmation is either an
+        // override (high-impact and/or external) or an executing decision that
+        // could not be proven/lifted. The two overrides are recorded
+        // independently so a high-impact action's external-content provenance is
+        // never lost.
+        let basis = match decision {
+            ActionDecision::PreviewThenExecute => DecisionBasis::ProvenReversible,
+            ActionDecision::Propose => DecisionBasis::Mode,
             // The lift caps `Proceed` to a preview, so it is unreachable here;
             // report it faithfully as the mode flow rather than assert.
-            ActionDecision::Proceed => DecisionReason::Mode,
+            ActionDecision::Proceed => DecisionBasis::Mode,
+            ActionDecision::RequireConfirmation => {
+                if kind.always_requires_confirmation() || ctx.external_trigger {
+                    DecisionBasis::Overridden
+                } else {
+                    DecisionBasis::Unproven
+                }
+            }
+        };
+        let reason = DecisionReason {
+            high_impact: kind.always_requires_confirmation().then_some(kind),
+            external_trigger: ctx.external_trigger,
+            basis,
         };
 
         // Audit-before-acting, fail-closed. The decision AND its faithful reason
@@ -503,28 +554,66 @@ fn decision_label(decision: ActionDecision) -> &'static str {
 /// durable audit `outcome` so the ledger records *why* a decision was made, not
 /// only what it was. This survives a dispatch aborted after the audit write
 /// (a reload/shutdown winning before the outcome is logged), which is exactly
-/// the post-incident path where the reason matters most. The high-impact label
-/// preserves the specific action class (still content-free: a class, never the
+/// the post-incident path where the reason matters most. ALL applicable causes
+/// are joined with `+` (e.g. `external-trigger+high-impact-permanent-delete`),
+/// so a high-impact action's external-content provenance is never lost. The
+/// high-impact label preserves the specific action class (still content-free: a
+/// class, never the operands).
+fn reason_label(reason: DecisionReason) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if reason.external_trigger {
+        parts.push("external-trigger");
+    }
+    if let Some(kind) = reason.high_impact {
+        parts.push(high_impact_class_label(kind));
+    }
+    match reason.basis {
+        DecisionBasis::Mode => parts.push("mode"),
+        DecisionBasis::ProvenReversible => parts.push("proven-reversible"),
+        DecisionBasis::Unproven => parts.push("unproven"),
+        // The overrides already pushed above are the cause; nothing to add.
+        DecisionBasis::Overridden => {}
+    }
+    if parts.is_empty() {
+        parts.push("unspecified");
+    }
+    parts.join("+")
+}
+
+/// The durable audit outcome for an out-of-scope refusal, with the same
+/// content-free cause set as a decision: the external-trigger fact and the
+/// high-impact class (by tool name, since an undeclared tool has no schema), so
+/// an injection attempt to call an undeclared destructive tool is reconstructable
+/// rather than flattened to a bare "out of scope".
+fn refusal_outcome(kind: ActionKind, external_trigger: bool) -> String {
+    let mut causes: Vec<&str> = Vec::new();
+    if external_trigger {
+        causes.push("external-trigger");
+    }
+    if kind.always_requires_confirmation() {
+        causes.push(high_impact_class_label(kind));
+    }
+    if causes.is_empty() {
+        "refused-out-of-scope".to_string()
+    } else {
+        format!("refused-out-of-scope:{}", causes.join("+"))
+    }
+}
+
+/// The content-free label for a high-impact action class (a class, never the
 /// operands), so the ledger distinguishes an irreversible link from a permanent
 /// delete or an external message.
-fn reason_label(reason: DecisionReason) -> &'static str {
-    match reason {
-        DecisionReason::HighImpact(kind) => match kind {
-            ActionKind::PermanentDelete => "high-impact-permanent-delete",
-            ActionKind::SendExternalMessage => "high-impact-external-message",
-            ActionKind::PackageChange => "high-impact-package-change",
-            ActionKind::SystemConfigChange => "high-impact-system-config",
-            ActionKind::UndeclaredNetwork => "high-impact-undeclared-network",
-            ActionKind::ElevatedPrivilege => "high-impact-elevated-privilege",
-            ActionKind::Irreversible => "high-impact-irreversible",
-            // Ordinary is not high-impact, so it never reaches a HighImpact
-            // reason; labelled defensively rather than asserted.
-            ActionKind::Ordinary => "high-impact",
-        },
-        DecisionReason::ExternalTrigger => "external-trigger",
-        DecisionReason::Unproven => "unproven",
-        DecisionReason::ProvenReversible => "proven-reversible",
-        DecisionReason::Mode => "mode",
+fn high_impact_class_label(kind: ActionKind) -> &'static str {
+    match kind {
+        ActionKind::PermanentDelete => "high-impact-permanent-delete",
+        ActionKind::SendExternalMessage => "high-impact-external-message",
+        ActionKind::PackageChange => "high-impact-package-change",
+        ActionKind::SystemConfigChange => "high-impact-system-config",
+        ActionKind::UndeclaredNetwork => "high-impact-undeclared-network",
+        ActionKind::ElevatedPrivilege => "high-impact-elevated-privilege",
+        ActionKind::Irreversible => "high-impact-irreversible",
+        // Ordinary is not high-impact, so it never reaches here; defensive.
+        ActionKind::Ordinary => "high-impact",
     }
 }
 
@@ -590,13 +679,42 @@ mod tests {
         // The faithful reason is the schema-derived irreversibility, not the mode.
         assert_eq!(
             receipt.reason,
-            DecisionReason::HighImpact(ActionKind::Irreversible)
+            DecisionReason::high_impact(ActionKind::Irreversible)
         );
         // The durable audit preserves the specific high-impact class, not just
         // "high-impact", so a post-incident reader knows it was irreversibility.
         assert_eq!(
             audit.recorded().await[0].structural.outcome,
             "require-confirmation:high-impact-irreversible"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_external_high_impact_action_records_both_causes() {
+        // An irreversible action *also* triggered by external content confirms
+        // for both reasons. The durable audit must record BOTH, so a
+        // prompt-injection incident reconstruction does not lose the external
+        // provenance of a high-impact action.
+        let cap = suggest_only();
+        let audit = MockAuditSink::accepting();
+        let obs = Recorder::default();
+        let receipt = Gate::new(&cap, &audit, &obs, &FsPathResolver, &StaticMountPolicy::empty())
+            .decide_action(
+                "some-behaviour",
+                BaselineMode::Suggest,
+                &scope(&["test.irreversible"]),
+                &irreversible_action(),
+                &ctx(true, "run-both"), // external trigger AND irreversible
+                &DeniedGraph,
+            )
+            .await
+            .expect("accepting sink");
+        assert_eq!(receipt.decision, ActionDecision::RequireConfirmation);
+        assert!(receipt.reason.external_trigger);
+        assert_eq!(receipt.reason.high_impact, Some(ActionKind::Irreversible));
+        assert_eq!(
+            audit.recorded().await[0].structural.outcome,
+            "require-confirmation:external-trigger+high-impact-irreversible"
         );
     }
 
@@ -637,7 +755,7 @@ mod tests {
             .expect("accepting sink");
 
         assert_eq!(receipt.decision, ActionDecision::Propose);
-        assert_eq!(receipt.reason, DecisionReason::Mode);
+        assert_eq!(receipt.reason, DecisionReason::mode());
         assert_eq!(receipt.audit_index, 0);
         // The decision was recorded, content-free + correlated, before returning.
         let recorded = audit.recorded().await;
@@ -708,7 +826,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receipt.decision, ActionDecision::RequireConfirmation);
-        assert_eq!(receipt.reason, DecisionReason::ExternalTrigger);
+        assert_eq!(receipt.reason, DecisionReason::external());
         // The reason is durable in the ledger, not only in the in-memory outcome.
         assert_eq!(
             audit.recorded().await[0].structural.outcome,
@@ -863,7 +981,7 @@ mod tests {
         // The world model proved the link safe, so the capability's executing
         // decision stands instead of being capped to confirmation.
         assert_eq!(receipt.decision, ActionDecision::PreviewThenExecute);
-        assert_eq!(receipt.reason, DecisionReason::ProvenReversible);
+        assert_eq!(receipt.reason, DecisionReason::proven_reversible());
         assert_eq!(obs.0.lock().unwrap().as_slice(), &[ActionDecision::PreviewThenExecute]);
     }
 
@@ -987,5 +1105,37 @@ mod tests {
             "refused-out-of-scope"
         );
         assert!(obs.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_external_high_impact_out_of_scope_refusal_records_both_causes() {
+        // A prompt-injection attempt: an externally-triggered proposal for an
+        // undeclared destructive tool. It is refused out of scope, but the
+        // durable ledger must still record the external trigger and the
+        // high-impact class (by name), not flatten it to a bare refusal.
+        let cap = suggest_only();
+        let audit = MockAuditSink::accepting();
+        let obs = Recorder::default();
+        let delete = ProposedAction {
+            tool: "delete_file".to_string(),
+            summary: "remove the file".to_string(),
+            arguments: BTreeMap::new(),
+        };
+        let err = Gate::new(&cap, &audit, &obs, &FsPathResolver, &StaticMountPolicy::empty())
+            .decide_action(
+                "some-behaviour",
+                BaselineMode::Suggest,
+                &scope(&["graph.write"]), // delete_file is not declared
+                &delete,
+                &ctx(true, "run-inject"), // external trigger
+                &DeniedGraph,
+            )
+            .await
+            .expect_err("an out-of-scope tool must be refused");
+        assert!(matches!(err, GateError::ToolOutOfScope { .. }));
+        assert_eq!(
+            audit.recorded().await[0].structural.outcome,
+            "refused-out-of-scope:external-trigger+high-impact-permanent-delete"
+        );
     }
 }

@@ -72,11 +72,10 @@ const MAX_COALESCE_ENTRIES: usize = 4096;
 /// classifier work against a hostile oversized field.
 const MAX_SCREEN_BYTES: usize = 64 * 1024;
 
-/// How many times the agent loop tolerates the model proposing the identical
-/// action consecutively before stopping for no progress. Counts repeats after
-/// the first sighting, so the model gets this many chances to break the loop
-/// before the run ends (here: propose X, X again, X again -> stop on the third).
-const MAX_REPEATED_PROPOSALS: u32 = 2;
+/// How many times the agent loop tolerates the identical [`ProgressKey`]
+/// consecutively before stopping for no progress. Counts repeats after the
+/// first sighting (here: same key, again, again -> stop on the third).
+const MAX_NO_PROGRESS_REPEATS: u32 = 2;
 
 /// Upper bound on one injection-screen scoring call. ONNX inference on bounded
 /// input is milliseconds, so this is generous headroom; its job is to stop a
@@ -84,6 +83,24 @@ const MAX_REPEATED_PROPOSALS: u32 = 2;
 /// delaying config revocation / shutdown) indefinitely. A timeout fails closed
 /// (the content is blocked).
 const SCREEN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The identity of one bounded-loop step for the no-progress guard (technique
+/// adapted from goose's tool_monitor, Apache-2.0). The same key repeated means
+/// the model is stuck, since the loop neither executes actions nor observes
+/// state between steps, so nothing changes to justify the repeat. Keyed
+/// differently by outcome. A refusal keys on the tool only, so a model cannot
+/// dodge the guard by re-wording the rationale of an action the gate keeps
+/// refusing. An acceptance keys on the tool *and* summary, so the same in-scope
+/// tool proposed for genuinely different work (a different summary) counts as
+/// progress, while an exact duplicate suggestion does not. Any different key
+/// resets the streak.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProgressKey {
+    /// An accepted (gated) proposal: tool + summary.
+    Accepted(String, String),
+    /// A refused proposal: tool only.
+    Refused(String),
+}
 
 /// What a workflow handler decides for a matched event.
 #[derive(Debug, Clone)]
@@ -802,13 +819,13 @@ impl<'a> Dispatcher<'a> {
         let mut outcomes = Vec::new();
         let mut transcript: Vec<TranscriptEntry> = Vec::new();
         let mut tokens_spent: u32 = 0;
-        // Repetition / no-progress guard (technique adapted from goose's
-        // tool_monitor, Apache-2.0): the last proposed action and how many times
-        // running it has been re-proposed identically. A model stuck re-proposing
-        // the same action (e.g. one the gate keeps refusing) otherwise burns the
-        // whole step/token/wall budget making no progress.
-        let mut last_proposal: Option<(String, String)> = None;
-        let mut repeated_proposals: u32 = 0;
+        // Repetition / no-progress guard: the last step's [`ProgressKey`] and how
+        // many times it has repeated. The loop neither executes nor observes
+        // between steps, so an identical key means the model is stuck (a refused
+        // action re-proposed, or an exact duplicate accepted suggestion) and is
+        // burning the budget for nothing.
+        let mut last_progress_key: Option<ProgressKey> = None;
+        let mut repeated_no_progress: u32 = 0;
         // The model's input window, from the wired provider, so the
         // context-window guard tracks the real backend rather than a guess.
         let window = provider.context_window();
@@ -975,24 +992,6 @@ impl<'a> Dispatcher<'a> {
                     return outcomes;
                 }
                 AgentStep::Propose { tool, summary } => {
-                    // No-progress guard: if the model proposes the identical
-                    // action several steps running, it is stuck, so stop early
-                    // rather than spend the rest of the budget on it. A
-                    // deterministic check inside the budget, no model call.
-                    let signature = (tool.clone(), summary.clone());
-                    if last_proposal.as_ref() == Some(&signature) {
-                        repeated_proposals += 1;
-                    } else {
-                        repeated_proposals = 0;
-                        last_proposal = Some(signature);
-                    }
-                    if repeated_proposals >= MAX_REPEATED_PROPOSALS {
-                        outcomes.push(DispatchOutcome::Terminal {
-                            behaviour,
-                            outcome: "no_progress".to_string(),
-                        });
-                        return outcomes;
-                    }
                     // One distinct correlation id per step, so each step's
                     // gate/audit entry is a separate, ordered ledger record.
                     let correlation_id = format!("{}:{}:step-{step}", event.id, behaviour);
@@ -1010,7 +1009,11 @@ impl<'a> Dispatcher<'a> {
                         summary,
                         arguments: Default::default(),
                     };
-                    match self
+                    // Capture the identity before `action` is moved into the
+                    // outcome, so the no-progress guard can key on it after.
+                    let tool_name = action.tool.clone();
+                    let summary_text = action.summary.clone();
+                    let progress_key = match self
                         .gate
                         .decide_action(&behaviour, m.mode, &m.tools, &action, &ctx, graph)
                         .await
@@ -1031,6 +1034,7 @@ impl<'a> Dispatcher<'a> {
                                 audit_index: receipt.audit_index,
                                 plan,
                             });
+                            ProgressKey::Accepted(tool_name, summary_text)
                         }
                         Err(GateError::AuditUnavailable(reason)) => {
                             // The audit boundary is down: do not keep acting
@@ -1052,7 +1056,26 @@ impl<'a> Dispatcher<'a> {
                                 behaviour: behaviour.clone(),
                                 reason: e.to_string(),
                             });
+                            ProgressKey::Refused(tool_name)
                         }
+                    };
+                    // No-progress guard: the identical key repeated (a refused
+                    // action re-proposed even reworded, or an exact duplicate
+                    // accepted suggestion) is a stuck loop, so stop rather than
+                    // burn the rest of the budget. The outcome above is recorded
+                    // first; any different key resets the streak.
+                    if last_progress_key.as_ref() == Some(&progress_key) {
+                        repeated_no_progress += 1;
+                    } else {
+                        repeated_no_progress = 0;
+                        last_progress_key = Some(progress_key);
+                    }
+                    if repeated_no_progress >= MAX_NO_PROGRESS_REPEATS {
+                        outcomes.push(DispatchOutcome::Terminal {
+                            behaviour,
+                            outcome: "no_progress".to_string(),
+                        });
+                        return outcomes;
                     }
                 }
             }
@@ -1556,7 +1579,7 @@ tools:
                     arguments: Default::default(),
                 },
                 decision: ActionDecision::Propose,
-                reason: DecisionReason::Mode,
+                reason: DecisionReason::mode(),
                 audit_index: 0,
                 plan: plan_for("graph.write"),
             }
@@ -1686,7 +1709,7 @@ tools:
                     arguments: Default::default(),
                 },
                 decision: ActionDecision::RequireConfirmation,
-                reason: DecisionReason::ExternalTrigger,
+                reason: DecisionReason::external(),
                 audit_index: 0,
                 plan: plan_for("graph.write"),
             }
@@ -1900,6 +1923,11 @@ trigger:
     fn propose(tool: &str) -> Result<String, ProviderError> {
         Ok(format!(
             "{{\"action\":\"propose\",\"tool\":\"{tool}\",\"summary\":\"do {tool}\"}}"
+        ))
+    }
+    fn propose_summary(tool: &str, summary: &str) -> Result<String, ProviderError> {
+        Ok(format!(
+            "{{\"action\":\"propose\",\"tool\":\"{tool}\",\"summary\":\"{summary}\"}}"
         ))
     }
     fn stop() -> Result<String, ProviderError> {
@@ -2290,16 +2318,93 @@ trigger:
     }
 
     #[tokio::test]
-    async fn agent_loop_stops_on_repeated_identical_proposals() {
-        // A high step budget, but the model proposes the identical action every
-        // step (never stops on its own). The no-progress guard must end the run
-        // well before the budget, on the third identical proposal.
+    async fn agent_loop_stops_on_repeatedly_refused_proposals() {
+        // A high step budget, but the model keeps proposing a tool outside the
+        // behaviour's declared scope (graph.write), so the gate refuses each one.
+        // The no-progress guard must end the run well before the budget, on the
+        // third refusal of the same tool.
         let behaviours = [loaded(&agent_skill(10, 1_000_000, 60_000), Status::Enabled)];
         let handlers = registry(Box::new(StubPropose));
         let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
         let audit = MockAuditSink::accepting();
         let obs = NullObserver;
         let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![
+            propose("fs.delete"), // out of scope -> refused
+            propose("fs.delete"),
+            propose("fs.delete"),
+            propose("fs.delete"),
+        ]);
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        );
+
+        let outcomes = d.dispatch(&event("~/foo.rs")).await;
+        assert!(outcomes.len() < 10, "stopped before the step budget");
+        assert!(matches!(
+            outcomes.last().unwrap(),
+            DispatchOutcome::Terminal { outcome, .. } if outcome == "no_progress"
+        ));
+        // Each refusal is recorded before the run stops.
+        assert_eq!(
+            outcomes.iter().filter(|o| matches!(o, DispatchOutcome::Refused { .. })).count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn no_progress_guard_resists_reworded_refusals() {
+        // The same out-of-scope tool refused every step but with a different
+        // summary each time: the guard keys on the refused tool, not the
+        // rationale, so re-wording cannot dodge it.
+        let behaviours = [loaded(&agent_skill(10, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![
+            propose_summary("fs.delete", "remove it"),
+            propose_summary("fs.delete", "please remove the file"),
+            propose_summary("fs.delete", "delete now"),
+            propose_summary("fs.delete", "rm"),
+        ]);
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        );
+
+        let outcomes = d.dispatch(&event("~/foo.rs")).await;
+        assert!(matches!(
+            outcomes.last().unwrap(),
+            DispatchOutcome::Terminal { outcome, .. } if outcome == "no_progress"
+        ));
+    }
+
+    #[tokio::test]
+    async fn identical_accepted_proposals_stop_for_no_progress() {
+        // The model re-proposes the EXACT same in-scope action (same tool and
+        // summary) every step. Nothing executes or is observed between steps, so
+        // it is stuck; the guard stops it before the budget even though each
+        // proposal is gated/accepted.
+        let behaviours = [loaded(&agent_skill(10, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        // `propose` uses a fixed summary, so these are exact duplicates.
         let provider = MockProvider::new(vec![
             propose("graph.write"),
             propose("graph.write"),
@@ -2317,16 +2422,53 @@ trigger:
         );
 
         let outcomes = d.dispatch(&event("~/foo.rs")).await;
-        // The first two identical proposals are gated; the third trips the guard.
         assert!(outcomes.len() < 10, "stopped before the step budget");
         assert!(matches!(
             outcomes.last().unwrap(),
             DispatchOutcome::Terminal { outcome, .. } if outcome == "no_progress"
         ));
+    }
+
+    #[tokio::test]
+    async fn repeated_same_tool_decisions_are_progress_not_no_progress() {
+        // The model proposes the same IN-SCOPE tool several times (legitimately
+        // different work, gated each time). A gate decision is progress, so the
+        // no-progress guard must NOT trip; the run ends on the model's stop.
+        let behaviours = [loaded(&agent_skill(10, 1_000_000, 60_000), Status::Enabled)];
+        let handlers = registry(Box::new(StubPropose));
+        let cap = Capability::new(AccessTier::Full, ActionPermissions::suggest_only());
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = EmptyGraph;
+        let provider = MockProvider::new(vec![
+            propose_summary("graph.write", "tag file a"),
+            propose_summary("graph.write", "tag file b"),
+            propose_summary("graph.write", "tag file c"),
+            stop(),
+        ]);
+        let d = Dispatcher::new(
+            &behaviours,
+            &handlers,
+            &graph,
+            AccessTier::Full,
+            gate(&audit, &obs, &cap),
+            Some(&provider),
+            &TEST_CLOCK,
+        );
+
+        let outcomes = d.dispatch(&event("~/foo.rs")).await;
+        assert!(
+            !outcomes.iter().any(|o| matches!(o, DispatchOutcome::Terminal { outcome, .. } if outcome == "no_progress")),
+            "legitimate same-tool work must not trip the no-progress guard"
+        );
         assert_eq!(
             outcomes.iter().filter(|o| matches!(o, DispatchOutcome::Decided { .. })).count(),
-            2
+            3
         );
+        assert!(matches!(
+            outcomes.last().unwrap(),
+            DispatchOutcome::Terminal { outcome, .. } if outcome == "done"
+        ));
     }
 
     #[tokio::test]
