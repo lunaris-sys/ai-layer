@@ -29,7 +29,7 @@ use lunaris_ai_agent::slice::{FsPathResolver, ProcMountsPolicy};
 use lunaris_ai_agent::graph::{UnixGraph, DEFAULT_GRAPH_SOCKET};
 use lunaris_ai_agent::handlers::builtin_handlers;
 use lunaris_ai_agent::loader::{load, BehaviourSource};
-use lunaris_ai_agent::seams::{NullObserver, SystemClock, TriggerSource};
+use lunaris_ai_agent::seams::{AgentEvent, NullObserver, SystemClock, TriggerSource};
 use lunaris_ai_agent::source::{subscription_types, EventBusSource, DEFAULT_CONSUMER_SOCKET};
 use lunaris_ai_core::audit::LedgerAuditSink;
 use lunaris_ai_core::capability::{AccessTier, Capability};
@@ -53,11 +53,17 @@ const SUBSCRIBE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Why an epoch ended.
+#[derive(Debug, PartialEq, Eq)]
 enum EpochEnd {
-    /// Config changed (or the watch was lost): rebuild from fresh settings.
+    /// Config changed (or the watch was lost): rebuild everything from fresh
+    /// settings, including re-subscribing the event source.
     Reload,
     /// A shutdown signal arrived: stop the daemon.
     Shutdown,
+    /// A pending provider's session bus recovered: rebuild only the provider
+    /// and dispatcher, keeping the existing subscription (and its buffered
+    /// events) so re-arming agent behaviours never drops delivered work.
+    RearmProvider,
 }
 
 #[tokio::main]
@@ -143,17 +149,15 @@ async fn establish_agent_connection() -> Option<Connection> {
 
 /// Build the proxied LLM provider for this epoch, **best-effort and
 /// non-blocking**: own the bus name (lazily, once) and build the provider, but
-/// never wait on the bus. If the session bus is unavailable or the build
-/// fails, return `None` so agent behaviours skip while unrelated workflow
-/// behaviours still subscribe and run; a build error clears the stored
-/// connection so the next epoch re-establishes rather than reusing a dead one.
-/// Recovery is by reload (a config change rebuilds the epoch and retries) or,
-/// for an agent-only config with nothing else runnable, by the supervisor
-/// restart §5.5 already prescribes. Blocking the epoch to retry the provider
-/// would starve workflow behaviours on an LLM/bus outage, so it is avoided; a
-/// concurrent background retry that re-arms agent behaviours mid-epoch without
-/// a reload (recovering a transient bus/proxy outage faster) is a deliberate
-/// daemon-hardening follow-up, not done here.
+/// never wait on the bus. Returns `None` (agent behaviours skip, workflow
+/// behaviours still run) when the session bus is unavailable. Building the
+/// proxy is lazy in zbus (it does not probe `ai-proxy`), so a build error
+/// means the *connection* is bad, not that the proxy is down; the connection
+/// is therefore cleared so the background recovery re-establishes a fresh one
+/// rather than reusing a dead one. (A down `ai-proxy` with the bus up still
+/// builds a provider; its forwards then fail per call and surface as `Failed`
+/// loop outcomes, not a build error.) `None` thus always leaves the connection
+/// unset, which the caller reads as a recoverable bus outage.
 async fn build_provider(
     settings: &ProviderSettings,
     connection: &mut Option<Connection>,
@@ -170,14 +174,50 @@ async fn build_provider(
     match built {
         Some(Ok(provider)) => Some(provider),
         Some(Err(e)) => {
-            tracing::warn!(error = %e, "could not build the LLM provider; re-establishing the connection next epoch; agent behaviours will not run this epoch");
+            tracing::warn!(error = %e, "could not build the LLM provider; the connection is unhealthy and will be re-established; agent behaviours will not run this epoch");
             *connection = None;
             None
         }
         None => {
-            tracing::warn!("a provider is configured but the session bus is unavailable; agent behaviours will not run this epoch (retried on reload)");
+            tracing::warn!("a provider is configured but the session bus is unavailable; agent behaviours will not run this epoch (retried in the background)");
             None
         }
+    }
+}
+
+/// Retry establishing the agent's session-bus connection with backoff until it
+/// succeeds, so a configured provider whose bus was late or briefly down comes
+/// online without the user touching anything. Returns once the connection is
+/// owned; the caller then rebuilds the provider and dispatcher in place
+/// (`RearmProvider`), keeping the subscription, so agent behaviours re-arm
+/// without dropping buffered events. Polled before the event source each
+/// iteration (see [`next_dispatch_step`]), so a steady event stream does not
+/// starve it. Runs concurrently with dispatch (or idle waiting) and is
+/// cancelled by being dropped when a config change, shutdown, or event-driven
+/// epoch end fires first.
+///
+/// This recovers a *build-time* bus outage (the provider could not be
+/// constructed at startup, or its connection was unhealthy). A *runtime* loss,
+/// where the provider built but a backend later restarts, is handled
+/// elsewhere: an `ai-proxy` restart self-recovers, because the proxy is
+/// addressed by its well-known name and the bus routes each forward to the
+/// current owner, so calls succeed again once it is back (only forwards during
+/// the restart fail, surfacing as `Failed` loop outcomes); a session-bus
+/// restart (rare, and effectively session-ending) leaves the connection dead
+/// until a config reload or supervisor restart. A liveness monitor that
+/// re-arms on a dead session connection mid-run needs a connection/proxy
+/// liveness probe that does not exist yet, a follow-up.
+async fn recover_connection(connection: &mut Option<Connection>) {
+    let mut backoff = SUBSCRIBE_BACKOFF_INITIAL;
+    loop {
+        tokio::time::sleep(backoff).await;
+        if connection.is_none() {
+            *connection = establish_agent_connection().await;
+        }
+        if connection.is_some() {
+            return;
+        }
+        backoff = (backoff * 2).min(SUBSCRIBE_BACKOFF_MAX);
     }
 }
 
@@ -254,61 +294,10 @@ async fn run(
             tracing::warn!(error = %err, "behaviour failed to load");
         }
 
-        // Build this epoch's LLM provider from the fresh config. When a
-        // provider is configured and an enabled agent behaviour needs it, the
-        // session bus is treated as a dependency to retry with backoff (like
-        // the Event Bus path), so a late bus does not leave agent behaviours
-        // offline; a config change or shutdown during the wait ends the epoch.
-        // The provider is rebuilt per epoch (it owns a cheap clone of the
-        // connection) so a settings change repoints it.
-        let needs_provider = outcome.loaded.iter().any(|b| {
-            agent_needs_provider(
-                b.status.is_enabled(),
-                b.behaviour.manifest.kind,
-                b.behaviour.manifest.reads,
-                config.read_tier,
-            )
-        });
-        // Build the provider only when one is configured and an eligible
-        // agent behaviour needs it. Best-effort and non-blocking: an
-        // unavailable bus leaves agents skipped but never blocks workflow
-        // behaviours from subscribing and running.
-        let provider_holder: Option<ProxiedProvider> = match (needs_provider, &config.provider) {
-            (true, Some(settings)) => build_provider(settings, connection).await,
-            _ => None,
-        };
-        let provider: Option<&dyn AIProvider> =
-            provider_holder.as_ref().map(|p| p as &dyn AIProvider);
-
-        // Foundation §5.5: with nothing *runnable* the daemon has no reason to
-        // run. A behaviour is runnable when enabled and either a workflow or
-        // (for an agent) backed by a configured provider. Exit cleanly
-        // otherwise (the supervisor restarts it when a runnable behaviour is
-        // enabled); this also covers a removed config.
-        let mut runnable = 0usize;
-        for b in &outcome.loaded {
-            let enabled = b.status.is_enabled();
-            let kind = b.behaviour.manifest.kind;
-            let reads = b.behaviour.manifest.reads;
-            if behaviour_is_runnable(enabled, kind, reads, config.read_tier, provider.is_some()) {
-                runnable += 1;
-            } else if agent_needs_provider(enabled, kind, reads, config.read_tier) {
-                // An eligible agent behaviour kept off only by a missing
-                // provider (an over-scoped one is skipped by the dispatcher
-                // with its own log, not here).
-                tracing::warn!(
-                    behaviour = %b.behaviour.manifest.name,
-                    "agent behaviour is enabled but no AI provider is available; it will not run"
-                );
-            }
-        }
-        if runnable == 0 {
-            tracing::info!("no runnable behaviours; the agent has nothing to do, exiting");
-            return Ok(());
-        }
-
-        tracing::info!(runnable, "starting agent");
-
+        // Config-scoped collaborators, built once per config epoch and reused
+        // across provider rebuilds: a bus recovery rebuilds only the provider
+        // and dispatcher (the inner loop below), keeping these and the
+        // subscription.
         let read_tier = config.read_tier;
         let capability = Capability::new(read_tier, config.actions);
         // The world-model seams the gate's predict-before-act step reads
@@ -316,33 +305,163 @@ async fn run(
         // and read-only mount resolvers.
         let paths = FsPathResolver;
         let mounts = ProcMountsPolicy;
-        let gate = Gate::new(&capability, audit, observer, &paths, &mounts);
         let clock = SystemClock;
-        // `read_tier` gates which behaviours may read at all: the dispatcher
-        // denies the graph to any behaviour whose declared `reads` exceeds it.
-        // It does NOT yet constrain the *content* of an allowed behaviour's
-        // queries to the tier (mandatory Cypher anchor injection on the
-        // current session / active project / lookback window). That finer,
-        // value-level enforcement has to live in the knowledge daemon, which
-        // does not yet carry a per-query tier on the wire; it is the same
-        // documented S16 follow-up the ai-daemon shares, not an agent-local
-        // concern. A process-local scope wrapper here would not bind a
-        // compromised handler (it could reach the knowledge socket directly),
-        // and B1 behaviours are trusted first-party built-ins, so the coarse
-        // gate is the boundary today.
-        let dispatcher =
-            Dispatcher::new(&outcome.loaded, handlers, graph, read_tier, gate, provider, &clock);
+        let needs_provider = outcome.loaded.iter().any(|b| {
+            agent_needs_provider(
+                b.status.is_enabled(),
+                b.behaviour.manifest.kind,
+                b.behaviour.manifest.reads,
+                read_tier,
+            )
+        });
+
+        // Foundation §5.5: if nothing *could* run under this config the daemon
+        // has no reason to run; exit cleanly before subscribing (the supervisor
+        // restarts it when a runnable behaviour is enabled). A behaviour could
+        // run when it is enabled, read-tier eligible, and either a workflow or
+        // an agent with a provider *configured* (the bus may be down now, but
+        // recovery would arm it). Checking this before `subscribe_with_retry`
+        // avoids blocking forever on the Event Bus for a config that has no
+        // behaviour needing it. This also covers a removed or all-disabled
+        // config.
+        let could_run = outcome.loaded.iter().any(|b| {
+            let enabled = b.status.is_enabled();
+            let reads = b.behaviour.manifest.reads;
+            enabled
+                && reads_satisfied(reads, read_tier)
+                && (b.behaviour.manifest.kind != BehaviourKind::Agent || config.provider.is_some())
+        });
+        if !could_run {
+            tracing::info!("no runnable behaviours under this config; the agent has nothing to do, exiting");
+            return Ok(());
+        }
 
         // Subscribe to exactly the event types the enabled behaviours need.
+        // The subscription is config-scoped: a provider recovery rebuilds the
+        // dispatcher in place (below) without dropping it, so buffered events
+        // survive re-arming.
         let types = subscription_types(&outcome.loaded);
         let mut source =
             match subscribe_with_retry(consumer_socket(), types, &watcher, &mut shutdown_rx).await {
                 Ok(s) => s,
                 Err(EpochEnd::Shutdown) => return Ok(()),
-                Err(EpochEnd::Reload) => continue,
+                Err(EpochEnd::Reload | EpochEnd::RearmProvider) => continue,
             };
 
-        match dispatch_until_change(&dispatcher, &mut source, &watcher, &mut shutdown_rx).await {
+        // Provider epoch: build the provider + dispatcher and dispatch; on a bus
+        // recovery rebuild only these (keeping the subscription) so agent
+        // behaviours re-arm without losing delivered work.
+        let epoch_end = loop {
+            // Build the provider only when one is configured and an eligible
+            // agent behaviour needs it. Best-effort and non-blocking: an
+            // unavailable bus leaves agents skipped but never blocks workflow
+            // behaviours from running. The provider owns a cheap clone of the
+            // connection, so rebuilding it per iteration is fine.
+            let provider_holder: Option<ProxiedProvider> = match (needs_provider, &config.provider) {
+                (true, Some(settings)) => build_provider(settings, connection).await,
+                _ => None,
+            };
+            let provider: Option<&dyn AIProvider> =
+                provider_holder.as_ref().map(|p| p as &dyn AIProvider);
+
+            // Foundation §5.5: a behaviour is runnable when enabled, read-tier
+            // eligible, and (for an agent) backed by a provider.
+            let mut runnable = 0usize;
+            for b in &outcome.loaded {
+                let enabled = b.status.is_enabled();
+                let kind = b.behaviour.manifest.kind;
+                let reads = b.behaviour.manifest.reads;
+                if behaviour_is_runnable(enabled, kind, reads, read_tier, provider.is_some()) {
+                    runnable += 1;
+                } else if agent_needs_provider(enabled, kind, reads, read_tier) {
+                    // An eligible agent behaviour kept off only by a missing
+                    // provider (an over-scoped one is skipped by the dispatcher
+                    // with its own log, not here).
+                    tracing::warn!(
+                        behaviour = %b.behaviour.manifest.name,
+                        "agent behaviour is enabled but no AI provider is available; it will not run"
+                    );
+                }
+            }
+            // A provider that is configured and needed but could not be built
+            // because the session bus was unavailable (`build_provider` leaves
+            // the connection unset on failure). The daemon then stays alive and
+            // retries the bus in the background, re-arming agent behaviours when
+            // it recovers, rather than exiting (an agent-only config would
+            // otherwise restart-loop) or waiting for an unrelated config change.
+            let pending_provider =
+                needs_provider && config.provider.is_some() && provider.is_none();
+
+            if runnable == 0 && !pending_provider {
+                tracing::info!("no runnable behaviours; the agent has nothing to do, exiting");
+                return Ok(());
+            }
+
+            let gate = Gate::new(&capability, audit, observer, &paths, &mounts);
+            // `read_tier` gates which behaviours may read at all: the dispatcher
+            // denies the graph to any behaviour whose declared `reads` exceeds
+            // it. It does NOT yet constrain the *content* of an allowed
+            // behaviour's queries to the tier (mandatory Cypher anchor injection
+            // on the current session / active project / lookback window). That
+            // finer, value-level enforcement has to live in the knowledge
+            // daemon, which does not yet carry a per-query tier on the wire; it
+            // is the same documented S16 follow-up the ai-daemon shares, not an
+            // agent-local concern. A process-local scope wrapper here would not
+            // bind a compromised handler (it could reach the knowledge socket
+            // directly), and B1 behaviours are trusted first-party built-ins, so
+            // the coarse gate is the boundary today.
+            let dispatcher =
+                Dispatcher::new(&outcome.loaded, handlers, graph, read_tier, gate, provider, &clock);
+
+            if runnable > 0 {
+                tracing::info!(runnable, "starting agent");
+            } else {
+                tracing::info!(
+                    "a provider is configured but its session bus is unavailable; waiting to enable agent behaviours"
+                );
+            }
+
+            // Dispatch until the config changes, a shutdown arrives, or (when a
+            // provider is pending) its bus recovers. Recovery is observed at the
+            // event boundary and rebuilds in place, so it neither starves behind
+            // events nor drops buffered ones. While a provider is pending, an
+            // agent-trigger event that arrives is dispatched against the
+            // provider-less dispatcher and recorded as `Skipped` (transparent,
+            // not silently dropped): the agent cannot run a behaviour without a
+            // model during the outage, and replaying a now-stale trigger after
+            // recovery is generally undesirable. Buffering and replaying agent
+            // events across an outage (split workflow/agent subscriptions) is a
+            // follow-up if a behaviour ever wants it.
+            let end = if pending_provider {
+                dispatch_until_change(
+                    &dispatcher,
+                    &mut source,
+                    &watcher,
+                    &mut shutdown_rx,
+                    recover_connection(connection),
+                )
+                .await
+            } else {
+                dispatch_until_change(
+                    &dispatcher,
+                    &mut source,
+                    &watcher,
+                    &mut shutdown_rx,
+                    std::future::pending(),
+                )
+                .await
+            };
+
+            match end {
+                // Bus recovered: rebuild the provider + dispatcher in place,
+                // keeping the subscription and its buffered events.
+                EpochEnd::RearmProvider => continue,
+                // Config change or shutdown: leave the provider epoch.
+                other => break other,
+            }
+        };
+
+        match epoch_end {
             EpochEnd::Shutdown => {
                 tracing::info!("shutdown signal received, stopping");
                 return Ok(());
@@ -351,38 +470,95 @@ async fn run(
                 tracing::info!("reloading agent settings");
                 // Loop: rebuild the pipeline from the fresh config.
             }
+            // Recovery is handled inside the provider epoch above.
+            EpochEnd::RearmProvider => {}
         }
     }
 }
 
-/// Dispatch events until the config changes or a shutdown signal arrives.
+/// What the dispatch loop should do next, decided by [`next_dispatch_step`].
+enum DispatchStep {
+    /// End the epoch (a config change or shutdown).
+    End(EpochEnd),
+    /// A pending provider's bus recovered; reload to re-arm agent behaviours.
+    Recovered,
+    /// Process this event.
+    Event(AgentEvent),
+    /// The event source closed permanently; rebuild to recover.
+    SourceClosed,
+}
+
+/// Pick the next dispatch action with a `biased` priority: a **config change /
+/// shutdown** wins first (revocation safety), then **provider recovery**, then
+/// the **next event**. Recovery is checked before the event source so it is
+/// polled (and so progresses) every iteration rather than being starved behind
+/// a busy event stream; it is safe to prefer it over a buffered event because
+/// recovery only rebuilds the provider/dispatcher in place (`RearmProvider`),
+/// keeping the subscription, so an event buffered now is still delivered after
+/// the rebuild. Kept separate from the loop so the ordering is unit-testable
+/// without a live event source.
+async fn next_dispatch_step(
+    config_change: impl std::future::Future<Output = EpochEnd>,
+    recovery: impl std::future::Future<Output = ()>,
+    next_event: impl std::future::Future<Output = Option<AgentEvent>>,
+) -> DispatchStep {
+    tokio::select! {
+        biased;
+        end = config_change => DispatchStep::End(end),
+        _ = recovery => DispatchStep::Recovered,
+        maybe = next_event => match maybe {
+            Some(event) => DispatchStep::Event(event),
+            None => DispatchStep::SourceClosed,
+        },
+    }
+}
+
+/// Dispatch events until the config changes, a shutdown signal arrives, or the
+/// `recovery` future resolves (a pending provider's bus came back, signalling
+/// a reload to re-arm agent behaviours). Pass `std::future::pending()` when
+/// there is nothing to recover.
 ///
 /// `biased` checks the config watcher before pulling the next event, and a
 /// revocation that lands between subscribing and acting is honored before the
 /// event is dispatched. So a settings change always wins over processing a
 /// further event under the old grants (at most the one event already in
-/// flight finishes under the previous settings).
+/// flight finishes under the previous settings). Recovery is checked only here
+/// at the event boundary, never against an active dispatch, so a bus recovery
+/// (unlike a revocation, not a safety reason to abort) cannot drop an in-flight
+/// workflow event.
 async fn dispatch_until_change(
     dispatcher: &Dispatcher<'_>,
     source: &mut EventBusSource,
     watcher: &ConfigWatcher,
     shutdown_rx: &mut watch::Receiver<bool>,
+    recovery: impl std::future::Future<Output = ()>,
 ) -> EpochEnd {
+    tokio::pin!(recovery);
     loop {
-        // Wait for the next event, ending the epoch on a config change or
-        // shutdown before any further dispatch under the old grants.
-        let event = tokio::select! {
-            biased;
-            end = wait_config_change(watcher, shutdown_rx) => return end,
-            maybe_event = source.recv() => match maybe_event {
-                // The SDK consumer reconnects internally, so a closed source
-                // means it is permanently gone; rebuild to recover.
-                None => {
-                    tracing::warn!("event source closed; rebuilding");
-                    return EpochEnd::Reload;
-                }
-                Some(event) => event,
-            },
+        // Wait for the next event, ending the epoch on a config change,
+        // shutdown, or provider recovery before any further dispatch.
+        let event = match next_dispatch_step(
+            wait_config_change(watcher, shutdown_rx),
+            &mut recovery,
+            source.recv(),
+        )
+        .await
+        {
+            DispatchStep::End(end) => return end,
+            // The provider's bus is back: re-arm by rebuilding the provider and
+            // dispatcher in place, keeping this subscription (and its buffered
+            // events) rather than dropping them.
+            DispatchStep::Recovered => {
+                tracing::info!("session bus recovered; re-arming agent behaviours");
+                return EpochEnd::RearmProvider;
+            }
+            // The SDK consumer reconnects internally, so a closed source means
+            // it is permanently gone; rebuild to recover.
+            DispatchStep::SourceClosed => {
+                tracing::warn!("event source closed; rebuilding");
+                return EpochEnd::Reload;
+            }
+            DispatchStep::Event(event) => event,
         };
         // A change that landed between subscribing and now is honored before
         // the event is dispatched.
@@ -674,5 +850,56 @@ mod tests {
         )
         .await;
         assert!(result.is_none());
+    }
+
+    fn an_event() -> AgentEvent {
+        AgentEvent {
+            id: "e1".to_string(),
+            event_type: "file.opened".to_string(),
+            fields: std::collections::BTreeMap::new(),
+            external_content: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_is_taken_before_a_buffered_event() {
+        use std::future::{pending, ready};
+        // A ready recovery and a buffered event: recovery wins (so it is never
+        // starved behind events). This is safe because recovery rebuilds in
+        // place (`RearmProvider`), keeping the subscription, so the buffered
+        // event is still delivered after the rebuild.
+        let step = next_dispatch_step(
+            pending::<EpochEnd>(),
+            ready(()),
+            ready(Some(an_event())),
+        )
+        .await;
+        assert!(matches!(step, DispatchStep::Recovered));
+    }
+
+    #[tokio::test]
+    async fn an_event_is_taken_when_recovery_is_pending() {
+        use std::future::{pending, ready};
+        let step = next_dispatch_step(
+            pending::<EpochEnd>(),
+            pending::<()>(),
+            ready(Some(an_event())),
+        )
+        .await;
+        assert!(matches!(step, DispatchStep::Event(_)));
+    }
+
+    #[tokio::test]
+    async fn a_config_change_wins_over_recovery_and_a_buffered_event() {
+        use std::future::ready;
+        // Revocation safety: a config change beats both a ready recovery and a
+        // buffered event.
+        let step = next_dispatch_step(
+            ready(EpochEnd::Reload),
+            ready(()),
+            ready(Some(an_event())),
+        )
+        .await;
+        assert!(matches!(step, DispatchStep::End(EpochEnd::Reload)));
     }
 }
