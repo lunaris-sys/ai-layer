@@ -160,6 +160,12 @@ pub enum ActionKind {
     UndeclaredNetwork,
     /// Running a command with elevated privileges.
     ElevatedPrivilege,
+    /// An action with no derivable compensation: it cannot be undone, so its
+    /// consequences are irreversible (Foundation §8.4, "irreversible or
+    /// high-impact"). Distinct from the tool-name classes above: this is derived
+    /// from the action's effects (its registry schema has no inverse), not its
+    /// tool name, and grounds the gate's previously-circular "reversible".
+    Irreversible,
     /// Any action not on the hardcoded high-impact list. Subject only
     /// to the action mode and the external-content rule.
     Ordinary,

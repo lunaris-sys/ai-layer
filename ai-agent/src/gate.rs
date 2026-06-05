@@ -259,11 +259,29 @@ impl<'a> Gate<'a> {
             });
         }
 
-        // Classify the proposed tool with the shared always-confirm
-        // classifier (the same one MCP dispatch uses) — never a risk class
-        // taken from the proposal. Combine with the mode (ceiling ∧ grant)
-        // for the trusted target app and the external-trigger override.
-        let kind = action_kind_for_tool(&action.tool);
+        // Reversibility (Foundation B1) grounds the gate's high-impact logic:
+        // "reversible" was assumed but never defined, leaving it circular. An
+        // action is reversible iff its registry-resolved schema has a derivable
+        // compensation. `None` = unregistered (unmodelled, not a *declared*
+        // irreversibility), `Some(false)` = registered but irreversible,
+        // `Some(true)` = reversible. A static property of the schema's effects.
+        let schema_reversible = registry::lookup(&action.tool).map(|t| t.is_reversible());
+
+        // Classify the proposed tool with the shared always-confirm classifier
+        // (the same one MCP dispatch uses) — never a risk class taken from the
+        // proposal. A tool already high-impact by name keeps that specific
+        // class; otherwise a registered-but-irreversible schema escalates to
+        // `Irreversible` (also high-impact), so an irreversible action always
+        // requires confirmation in EVERY mode, not only the executing one. An
+        // unregistered tool stays Ordinary and is held back instead by the lift
+        // below, which needs a proof it cannot get. Combine with the mode
+        // (ceiling ∧ grant) and the external-trigger override.
+        let base_kind = action_kind_for_tool(&action.tool);
+        let kind = if !base_kind.always_requires_confirmation() && schema_reversible == Some(false) {
+            ActionKind::Irreversible
+        } else {
+            base_kind
+        };
         let decision =
             self.capability
                 .decide_for_behaviour(ctx.app_id, kind, ctx.external_trigger, ceiling);
@@ -294,20 +312,24 @@ impl<'a> Gate<'a> {
         };
 
         let decision = match decision {
-            // A proven executing action is lifted, but only to a *previewed*
-            // execution, never silent autonomous `Proceed`. Two boundaries are
-            // not yet in place that full auto-execution would need, so the
-            // human-visible preview is the bridge: (1) the proof is a
-            // point-in-time slice (the graph has no snapshot/version, gap A2),
+            // A proven, reversible executing action is lifted, but only to a
+            // *previewed* execution, never silent autonomous `Proceed`. Two
+            // boundaries are not yet in place that full auto-execution would
+            // need, so the human-visible preview is the bridge: (1) the proof is
+            // a point-in-time slice (the graph has no snapshot/version, gap A2),
             // so the executor that eventually acts on a lifted decision must
             // re-check the preconditions atomically at write time; (2) the
             // per-app grant consulted is the *agent's own* (the acting app),
             // the current coarse model, so a finer per-target/per-behaviour
             // grant is future work. Capping at preview keeps a human in the
-            // loop until those land. Nothing executes today (there is no
-            // executor); this is the authorization the executor will honour.
+            // loop until those land. Only a `Some(true)` reversible schema is
+            // lifted: an irreversible one was already escalated to `Irreversible`
+            // above (so it never reaches this arm), and an unregistered tool
+            // (`None`) cannot be proven, so both stay confirmation. Nothing
+            // executes today (there is no executor); this is the authorization
+            // the executor will honour.
             ActionDecision::PreviewThenExecute | ActionDecision::Proceed => {
-                if proven {
+                if proven && schema_reversible == Some(true) {
                     ActionDecision::PreviewThenExecute
                 } else {
                     ActionDecision::RequireConfirmation
@@ -454,6 +476,37 @@ mod tests {
             summary: "tag foo.rs as part of lunaris-sys".to_string(),
             arguments: BTreeMap::new(),
         }
+    }
+
+    fn irreversible_action() -> ProposedAction {
+        ProposedAction {
+            tool: "test.irreversible".to_string(),
+            summary: "an action with no derivable compensation".to_string(),
+            arguments: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_irreversible_action_requires_confirmation_even_in_suggest_mode() {
+        // Foundation B1: an action whose registry schema has no compensation is
+        // irreversible -> high-impact -> always confirm, in EVERY mode. Under
+        // Suggest the preliminary decision would be Propose; the schema-derived
+        // Irreversible classification escalates it to RequireConfirmation.
+        let cap = suggest_only();
+        let audit = MockAuditSink::accepting();
+        let obs = Recorder::default();
+        let receipt = Gate::new(&cap, &audit, &obs, &FsPathResolver, &StaticMountPolicy::empty())
+            .decide_action(
+                "some-behaviour",
+                BaselineMode::Suggest,
+                &scope(&["test.irreversible"]),
+                &irreversible_action(),
+                &ctx(false, "run-irrev"),
+                &DeniedGraph,
+            )
+            .await
+            .expect("accepting sink");
+        assert_eq!(receipt.decision, ActionDecision::RequireConfirmation);
     }
 
     /// A trusted action context targeting a fixed app.

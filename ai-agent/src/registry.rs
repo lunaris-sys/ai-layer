@@ -18,7 +18,7 @@
 //! schema here.
 #![allow(dead_code)]
 
-use crate::world::{ActionSchema, Effect, Predicate, Provenance};
+use crate::world::{compensation_of, ActionSchema, Effect, Predicate, Provenance};
 
 /// An [`ActionSchema`] the registry vouches for. Its single field is private
 /// and it has no public constructor, so it can only be produced by [`lookup`]
@@ -34,6 +34,19 @@ impl TrustedActionSchema {
     pub(crate) fn schema(&self) -> &ActionSchema {
         &self.schema
     }
+
+    /// Whether this action is reversible (Foundation B1): its effect sequence
+    /// has a derivable compensation in the same world-model DSL. This grounds
+    /// the gate's "reversible" predicate, which was previously assumed: an
+    /// action with no compensation is irreversible, so it is high-impact and
+    /// must always be confirmed (never lifted to autonomous preview). Reversible
+    /// is defined conservatively (see [`compensation_of`]): an effect that needs
+    /// prior state to undo (a field set, a node removal) is not auto-invertible,
+    /// so a schema containing one is irreversible unless it later declares an
+    /// explicit compensation.
+    pub(crate) fn is_reversible(&self) -> bool {
+        compensation_of(&self.schema.effects).is_some()
+    }
 }
 
 /// Resolve the given-rule schema for an invoked action/tool id, or `None` if
@@ -43,6 +56,20 @@ impl TrustedActionSchema {
 pub(crate) fn lookup(action_id: &str) -> Option<TrustedActionSchema> {
     let schema = match action_id {
         "graph.write" => graph_write_link_schema(),
+        // A registered but irreversible action, for the gate's
+        // irreversible-always-confirms tests (a `SetField` cannot be inverted
+        // from itself, so the schema has no derivable compensation).
+        #[cfg(test)]
+        "test.irreversible" => ActionSchema {
+            action: "test.irreversible".to_string(),
+            preconditions: vec![],
+            effects: vec![Effect::SetField {
+                bind: "x".to_string(),
+                field: "f".to_string(),
+                value: "v".to_string(),
+            }],
+            provenance: Provenance::Given,
+        },
         _ => return None,
     };
     Some(TrustedActionSchema { schema })
@@ -106,6 +133,29 @@ mod tests {
     fn an_unknown_action_has_no_rule() {
         assert!(lookup("fs.delete").is_none());
         assert!(lookup("").is_none());
+    }
+
+    #[test]
+    fn reversibility_is_grounded_in_derivable_compensation() {
+        // The built-in link rule asserts one edge, which inverts cleanly, so it
+        // is reversible (and may be lifted to autonomous preview when proven).
+        assert!(lookup("graph.write").unwrap().is_reversible());
+        // A schema whose effect cannot be inverted from itself alone (a field
+        // set needs the prior value) is irreversible: the gate must always
+        // confirm it.
+        let irreversible = TrustedActionSchema {
+            schema: ActionSchema {
+                action: "x".to_string(),
+                preconditions: vec![],
+                effects: vec![Effect::SetField {
+                    bind: "a".to_string(),
+                    field: "f".to_string(),
+                    value: "v".to_string(),
+                }],
+                provenance: Provenance::Given,
+            },
+        };
+        assert!(!irreversible.is_reversible());
     }
 
     #[test]

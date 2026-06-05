@@ -550,10 +550,19 @@ impl SliceSpec {
                 self.add_ident(field);
                 self.mark_node(bind);
             }
+            // Load the target edge's prior presence (as RetractEdge does), so a
+            // strict AssertEdge sees a pre-existing edge and fails closed even
+            // when the schema omits a Not(EdgeExists) precondition. Without this
+            // the slice would have no edge row, the assertion would look like a
+            // clean create, and the derived inverse could later delete an edge
+            // the action did not create (an unsound rollback). graph.write
+            // already loads it via its Not(EdgeExists) precondition, so this is
+            // a no-op there and the safeguard for any future schema.
             Effect::AssertEdge { from, edge, to } => {
                 self.add_ident(edge);
                 self.mark_node(from);
                 self.mark_node(to);
+                self.edges.insert((from.clone(), edge.clone(), to.clone()));
             }
         }
     }
@@ -1352,6 +1361,48 @@ tmpfs /tmp\\040dir tmpfs rw 0 0
         let cap = capability();
         let p = predict(&schema, &bnd, &state, &ctx(&cap, "graph.write"));
         assert!(p.is_valid(), "expected Valid, got {p:?}");
+    }
+
+    #[tokio::test]
+    async fn an_assert_edge_schema_without_an_absence_precondition_fails_closed_when_the_edge_exists() {
+        // Schema drift: the rule asserts the edge but omits Not(EdgeExists). The
+        // slice still loads the target edge's prior presence (the strict-create
+        // safeguard), so when the real graph already has the edge the assertion
+        // is an EffectError, not a Valid clean create whose derived inverse would
+        // delete an edge the action never created.
+        let schema = ActionSchema {
+            action: "graph.write".to_string(),
+            preconditions: vec![
+                Predicate::NodeExists { bind: "file".to_string(), label: "File".to_string() },
+                Predicate::NodeExists { bind: "proj".to_string(), label: "Project".to_string() },
+                // No Not(EdgeExists), deliberately.
+            ],
+            effects: vec![Effect::AssertEdge {
+                from: "file".to_string(),
+                edge: "FILE_PART_OF".to_string(),
+                to: "proj".to_string(),
+            }],
+            provenance: Provenance::Given,
+        };
+        let graph = MockGraph::new()
+            .on("n:File {id: 'f1'}", vec![row(&[("id", Value::String("f1".into()))])])
+            .on("n:Project {id: 'p1'}", vec![row(&[("id", Value::String("p1".into()))])])
+            // The FILE_PART_OF edge already exists in the real graph.
+            .on("count(*) AS cnt", vec![row(&[("cnt", serde_json::json!(1))])]);
+        let (state, bnd) = build_slice(
+            &schema,
+            "graph.write",
+            &bindings(&[("file", "f1"), ("proj", "p1")]),
+            &graph,
+            &MockResolver::new(&[]),
+            &StaticMountPolicy::empty(),
+        )
+        .await
+        .unwrap();
+        let cap = capability();
+        let p = predict(&schema, &bnd, &state, &ctx(&cap, "graph.write"));
+        assert!(matches!(p, Prediction::EffectError { .. }), "got {p:?}");
+        assert!(p.predicted_state().is_none());
     }
 
     #[tokio::test]

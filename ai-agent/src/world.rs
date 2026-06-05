@@ -297,6 +297,58 @@ pub enum Effect {
     },
 }
 
+impl Effect {
+    /// The compensation (inverse) of this effect, expressed in the same DSL, or
+    /// `None` when the effect cannot be inverted from itself alone.
+    ///
+    /// This grounds the gate's "reversible" predicate (Foundation B1): an
+    /// effect with a derivable inverse can be undone; one without is
+    /// irreversible and must be treated as high-impact (always confirm). The
+    /// derivation is deliberately conservative, never guessing a state it does
+    /// not hold:
+    ///
+    /// - `AssertEdge` ⇄ `RetractEdge` (and back): the forward effect's
+    ///   precondition guarantees the edge was absent (resp. present) before, so
+    ///   removing (resp. re-adding) exactly that edge restores the prior state.
+    /// - `AssertNode` → `RetractNode`: the forward effect created a bare node
+    ///   that did not exist before, so retracting it restores its absence. Sound
+    ///   only inside a [`compensation_of`] sequence, which undoes any edges the
+    ///   same action added to the node *first* (reverse order).
+    /// - `RetractNode` → `None`: re-creating the node would need its prior
+    ///   label, fields, and every edge that touched it, none of which the effect
+    ///   carries. Irreversible from the effect alone.
+    /// - `SetField` → `None`: restoring needs the field's prior value, which the
+    ///   effect does not carry. Irreversible from the effect alone (a schema
+    ///   that captures the prior value can declare a `SetField` compensation
+    ///   explicitly; auto-derivation must not invent one).
+    pub(crate) fn inverse(&self) -> Option<Effect> {
+        match self {
+            Effect::AssertEdge { from, edge, to } => Some(Effect::RetractEdge {
+                from: from.clone(),
+                edge: edge.clone(),
+                to: to.clone(),
+            }),
+            Effect::RetractEdge { from, edge, to } => Some(Effect::AssertEdge {
+                from: from.clone(),
+                edge: edge.clone(),
+                to: to.clone(),
+            }),
+            Effect::AssertNode { bind, .. } => Some(Effect::RetractNode { bind: bind.clone() }),
+            Effect::RetractNode { .. } | Effect::SetField { .. } => None,
+        }
+    }
+}
+
+/// The compensation of an effect sequence: each effect's inverse, applied in
+/// reverse order, or `None` if any effect is not invertible (the whole sequence
+/// is then irreversible, fail-closed). Reverse order matters: an action that
+/// asserts a node and then an edge to it compensates by retracting the edge
+/// first, then the node, so no [`Effect::RetractNode`] strips an edge a later
+/// compensation step still depends on.
+pub(crate) fn compensation_of(effects: &[Effect]) -> Option<Vec<Effect>> {
+    effects.iter().rev().map(Effect::inverse).collect()
+}
+
 /// Where an action schema came from. This increment exercises only `Given`
 /// (rules from the schema + capability layer, ground truth day one); the
 /// `Learned` induction pipeline is a later increment, but the field exists
@@ -603,19 +655,20 @@ fn apply_effects(effects: &[Effect], b: &Bindings, state: &WorldState) -> Result
         match effect {
             Effect::AssertNode { bind, label } => {
                 let id = bind_id(b, bind)?;
-                match s.nodes.get(id) {
-                    Some(node) if &node.label != label => {
-                        return Err(format!(
-                            "AssertNode {id:?}: a node already exists with label {:?}, not {label:?}",
-                            node.label
-                        ));
-                    }
-                    Some(_) => {} // already present with the asserted label
-                    None => {
-                        s.nodes
-                            .insert(id.clone(), Node::new(id.clone(), label.clone()));
-                    }
+                // Strict create: an assertion must *create*, never no-op over a
+                // pre-existing node. A no-op would make the derived inverse
+                // (`RetractNode`) delete state the action did not create, an
+                // unsound rollback (Foundation B1). Failing here also means a
+                // schema that omits the matching absence precondition produces an
+                // `EffectError` when the target exists, so it is never lifted.
+                if let Some(node) = s.nodes.get(id) {
+                    return Err(format!(
+                        "AssertNode {id:?}: a node already exists (label {:?}); an assertion must create, so its inverse retracts only what it created",
+                        node.label
+                    ));
                 }
+                s.nodes
+                    .insert(id.clone(), Node::new(id.clone(), label.clone()));
             }
             Effect::RetractNode { bind } => {
                 let id = bind_id(b, bind)?;
@@ -636,7 +689,18 @@ fn apply_effects(effects: &[Effect], b: &Bindings, state: &WorldState) -> Result
                         "AssertEdge {f:?}-{edge:?}-{t:?}: an endpoint node is missing (dangling edge)"
                     ));
                 }
-                s.edges.insert((f.clone(), edge.clone(), t.clone()));
+                // Strict create (see AssertNode): a no-op over a pre-existing
+                // edge would make the derived inverse (`RetractEdge`) delete an
+                // edge the action did not create, an unsound rollback. Failing
+                // here keeps the inverse sound and fails a precondition-less
+                // schema closed at predict time.
+                let key = (f.clone(), edge.clone(), t.clone());
+                if s.edges.contains(&key) {
+                    return Err(format!(
+                        "AssertEdge {f:?}-{edge:?}-{t:?}: the edge already exists; an assertion must create, so its inverse retracts only what it created"
+                    ));
+                }
+                s.edges.insert(key);
             }
             Effect::RetractEdge { from, edge, to } => {
                 let f = bind_id(b, from)?;
@@ -936,6 +1000,104 @@ mod tests {
         assert!(after.has_edge("a", "NEW", "b"));
         assert!(!after.has_edge("a", "OLD", "b"));
         assert_eq!(after.node("a").unwrap().fields.get("tagged").unwrap(), "yes");
+    }
+
+    #[test]
+    fn asserting_an_existing_edge_is_an_effect_error_not_a_no_op() {
+        // The edge already exists. A silent no-op would let the derived
+        // compensation (RetractEdge) delete a pre-existing edge the action never
+        // created, so the assertion must fail instead.
+        let state = WorldState::new()
+            .with_node(Node::new("a", "File"))
+            .with_node(Node::new("b", "Project"))
+            .with_edge("a", "FILE_PART_OF", "b");
+        let err = apply_effects(
+            &[Effect::AssertEdge { from: "a".into(), edge: "FILE_PART_OF".into(), to: "b".into() }],
+            &bindings(&[("a", "a"), ("b", "b")]),
+            &state,
+        );
+        assert!(err.is_err());
+        // The pre-existing edge is untouched (no partial mutation).
+        assert!(state.has_edge("a", "FILE_PART_OF", "b"));
+    }
+
+    #[test]
+    fn asserting_an_existing_node_is_an_effect_error_even_with_the_same_label() {
+        let state = WorldState::new().with_node(Node::new("x", "File"));
+        let err = apply_effects(
+            &[Effect::AssertNode { bind: "x".into(), label: "File".into() }],
+            &bindings(&[("x", "x")]),
+            &state,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn effect_inverse_per_type() {
+        let assert_edge = Effect::AssertEdge { from: "a".into(), edge: "E".into(), to: "b".into() };
+        let retract_edge = Effect::RetractEdge { from: "a".into(), edge: "E".into(), to: "b".into() };
+        assert_eq!(assert_edge.inverse(), Some(retract_edge.clone()));
+        assert_eq!(retract_edge.inverse(), Some(assert_edge));
+        assert_eq!(
+            Effect::AssertNode { bind: "a".into(), label: "File".into() }.inverse(),
+            Some(Effect::RetractNode { bind: "a".into() })
+        );
+        // Not invertible from the effect alone (prior state unknown).
+        assert_eq!(Effect::RetractNode { bind: "a".into() }.inverse(), None);
+        assert_eq!(
+            Effect::SetField { bind: "a".into(), field: "t".into(), value: "y".into() }.inverse(),
+            None
+        );
+    }
+
+    #[test]
+    fn compensation_reverses_order_and_inverts_each() {
+        // Assert a node then an edge to it: the compensation retracts the edge
+        // first, then the node (reverse order), so the node retraction never
+        // strips an edge a later step still needs.
+        let forward = [
+            Effect::AssertNode { bind: "f".into(), label: "File".into() },
+            Effect::AssertEdge { from: "f".into(), edge: "FILE_PART_OF".into(), to: "p".into() },
+        ];
+        assert_eq!(
+            compensation_of(&forward),
+            Some(vec![
+                Effect::RetractEdge { from: "f".into(), edge: "FILE_PART_OF".into(), to: "p".into() },
+                Effect::RetractNode { bind: "f".into() },
+            ])
+        );
+    }
+
+    #[test]
+    fn compensation_is_none_when_any_effect_is_irreversible() {
+        let forward = [
+            Effect::AssertEdge { from: "a".into(), edge: "E".into(), to: "b".into() },
+            Effect::SetField { bind: "a".into(), field: "t".into(), value: "y".into() },
+        ];
+        assert_eq!(compensation_of(&forward), None);
+    }
+
+    #[test]
+    fn forward_then_compensation_restores_state() {
+        // Soundness: applying a forward effect sequence and then its
+        // compensation returns the world to its starting point.
+        let original = WorldState::new().with_node(Node::new("p1", "Project"));
+        let b = bindings(&[("f", "f1"), ("p", "p1")]);
+        let forward = [
+            Effect::AssertNode { bind: "f".into(), label: "File".into() },
+            Effect::AssertEdge { from: "f".into(), edge: "FILE_PART_OF".into(), to: "p".into() },
+        ];
+        let after = apply_effects(&forward, &b, &original).expect("forward applies");
+        assert!(after.node("f1").is_some());
+        assert!(after.has_edge("f1", "FILE_PART_OF", "p1"));
+
+        let comp = compensation_of(&forward).expect("forward is reversible");
+        let restored = apply_effects(&comp, &b, &after).expect("compensation applies");
+        // Back to the start: the node and edge the action added are gone, the
+        // pre-existing project node remains.
+        assert!(restored.node("f1").is_none());
+        assert!(!restored.has_edge("f1", "FILE_PART_OF", "p1"));
+        assert!(restored.node("p1").is_some());
     }
 
     #[test]
