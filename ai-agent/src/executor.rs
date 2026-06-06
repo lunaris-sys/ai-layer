@@ -42,9 +42,10 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lunaris_ai_core::audit::{behaviour_action_event, AuditSink};
 use lunaris_ai_core::capability::{ActionDecision, BaselineMode, Capability};
 
-use crate::gate::{resolved_action_kind, ProposedAction};
+use crate::gate::{resolved_action_kind, ActionContext, ProposedAction};
 use crate::registry::{self, TrustedActionSchema};
 use crate::seams::GraphHandle;
 use crate::slice::{build_slice_trusted, MountPolicy, PathResolver};
@@ -117,6 +118,11 @@ pub enum ExecError {
     /// knowledge socket or a slow path lookup must not park the executor.
     #[error("re-validation timed out before the write")]
     RevalidationTimeout,
+    /// The audit ledger could not record the execution. Fail-closed: the write
+    /// is not performed, so no graph mutation happens without a durable record
+    /// of it (the S13 audit-before-acting invariant the gate also honours).
+    #[error("audit unavailable, execution refused: {0}")]
+    AuditUnavailable(String),
 }
 
 /// A failure to persist a planned relation write.
@@ -364,6 +370,7 @@ pub struct LiveExecutor<'a> {
     paths: &'a dyn PathResolver,
     mounts: &'a dyn MountPolicy,
     writer: &'a dyn RelationWriter,
+    audit: &'a dyn AuditSink,
 }
 
 impl<'a> LiveExecutor<'a> {
@@ -373,12 +380,14 @@ impl<'a> LiveExecutor<'a> {
         paths: &'a dyn PathResolver,
         mounts: &'a dyn MountPolicy,
         writer: &'a dyn RelationWriter,
+        audit: &'a dyn AuditSink,
     ) -> Self {
         Self {
             capability,
             paths,
             mounts,
             writer,
+            audit,
         }
     }
 
@@ -401,14 +410,20 @@ impl<'a> LiveExecutor<'a> {
     /// create enforces only endpoint existence and edge absence, not the agent's
     /// path-prefix predicate. Fully closing that needs a graph snapshot/version
     /// the engine does not expose (gap A2); it is why nothing wires this live yet.
+    ///
+    /// `behaviour_name` and `ctx` are the trusted, dispatch-supplied ids (never
+    /// the proposal), the same the gate decided with, so the execution audit
+    /// links to that decision via the shared correlation id. The execution is
+    /// audited fail-closed **before** the write (S13 audit-before-acting): if the
+    /// ledger is unavailable, nothing is written.
     pub async fn execute(
         &self,
         action: &ProposedAction,
         decision: ActionDecision,
         tool_scope: &[String],
         graph: &dyn GraphHandle,
-        app_id: &str,
-        external_trigger: bool,
+        behaviour_name: &str,
+        ctx: &ActionContext<'_>,
         ceiling: BaselineMode,
     ) -> Result<Option<ExecutedWrite>, ExecError> {
         // Plan: only a proven PreviewThenExecute yields a write, and the planned
@@ -443,18 +458,26 @@ impl<'a> LiveExecutor<'a> {
         let eval = EvalContext {
             capability: self.capability,
             action_id: &action.tool,
-            app_id,
+            app_id: ctx.app_id,
             action_kind: resolved_action_kind(&action.tool),
-            external_trigger,
+            external_trigger: ctx.external_trigger,
             ceiling,
         };
         if !world::predict(trusted.schema(), &bindings, &state, &eval).is_valid() {
             return Err(ExecError::ProofStale);
         }
 
-        // The proof still holds: perform the authorised write. The outcome
-        // (created vs already-present) is carried back so only a real create is
-        // ever compensated.
+        // Audit the execution BEFORE the write, fail-closed (S13): the graph is
+        // not mutated without a durable, content-free record of the act, linked
+        // to the gate's decision entry by the shared correlation id.
+        self.audit
+            .submit(behaviour_action_event(behaviour_name, "execute", ctx.correlation_id))
+            .await
+            .map_err(|e| ExecError::AuditUnavailable(e.to_string()))?;
+
+        // The proof still holds and the act is recorded: perform the authorised
+        // write. The outcome (created vs already-present) is carried back so only
+        // a real create is ever compensated.
         let outcome = self
             .writer
             .write_relation(&report.write)
@@ -604,6 +627,7 @@ mod tests {
 
     use crate::seams::GraphError;
     use crate::slice::{SliceError, StaticMountPolicy};
+    use audit_proto::MockAuditSink;
     use lunaris_ai_core::capability::{AccessTier, ActionPermissions};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -688,21 +712,31 @@ mod tests {
         }
     }
 
+    /// The trusted per-call context the dispatcher supplies (never the proposal).
+    fn ctx() -> ActionContext<'static> {
+        ActionContext {
+            app_id: "org.lunaris.files",
+            external_trigger: false,
+            correlation_id: "run-x",
+        }
+    }
+
     #[tokio::test]
-    async fn live_executor_writes_a_revalidated_proof() {
+    async fn live_executor_writes_and_audits_a_revalidated_proof() {
         let cap = executing_cap();
         let writer = MockWriter::default();
+        let audit = MockAuditSink::accepting();
         let graph = tag_graph(false); // file under root, not yet linked
         let (resolver, mounts) = (IdentityResolver, StaticMountPolicy::empty());
-        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer);
+        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer, &audit);
         let written = exec
             .execute(
                 &tag_action(),
                 ActionDecision::PreviewThenExecute,
                 &auto_tag_scope(),
                 &graph,
-                "org.lunaris.files",
-                false,
+                "auto-tag-by-project",
+                &ctx(),
                 BaselineMode::Supervised,
             )
             .await
@@ -714,24 +748,59 @@ mod tests {
         assert_eq!(recorded.len(), 1, "exactly one write performed");
         assert_eq!(recorded[0].to_type, "system.Project");
         assert_eq!(recorded[0].from_id, "/proj/a.rs");
+
+        // The execution is recorded content-free, linked to the gate decision
+        // by the shared correlation id.
+        let entries = audit.recorded().await;
+        assert_eq!(entries.len(), 1, "the execution is audited once");
+        assert_eq!(entries[0].structural.subject, "agent.auto-tag-by-project");
+        assert_eq!(entries[0].structural.outcome, "execute");
+        assert_eq!(entries[0].call_chain_id.as_deref(), Some("run-x"));
     }
 
     #[tokio::test]
-    async fn live_executor_refuses_a_stale_proof() {
+    async fn live_executor_refuses_when_the_audit_is_unavailable() {
         let cap = executing_cap();
         let writer = MockWriter::default();
-        // The edge already exists, so Not(EdgeExists) fails: the proof is stale.
-        let graph = tag_graph(true);
+        let audit = MockAuditSink::failing();
+        let graph = tag_graph(false); // a valid proof, so only the audit blocks
         let (resolver, mounts) = (IdentityResolver, StaticMountPolicy::empty());
-        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer);
+        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer, &audit);
         let result = exec
             .execute(
                 &tag_action(),
                 ActionDecision::PreviewThenExecute,
                 &auto_tag_scope(),
                 &graph,
-                "org.lunaris.files",
-                false,
+                "auto-tag-by-project",
+                &ctx(),
+                BaselineMode::Supervised,
+            )
+            .await;
+        assert!(matches!(result, Err(ExecError::AuditUnavailable(_))));
+        assert!(
+            writer.0.lock().unwrap().is_empty(),
+            "no write may happen when the act cannot be audited"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_executor_refuses_a_stale_proof() {
+        let cap = executing_cap();
+        let writer = MockWriter::default();
+        let audit = MockAuditSink::accepting();
+        // The edge already exists, so Not(EdgeExists) fails: the proof is stale.
+        let graph = tag_graph(true);
+        let (resolver, mounts) = (IdentityResolver, StaticMountPolicy::empty());
+        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer, &audit);
+        let result = exec
+            .execute(
+                &tag_action(),
+                ActionDecision::PreviewThenExecute,
+                &auto_tag_scope(),
+                &graph,
+                "auto-tag-by-project",
+                &ctx(),
                 BaselineMode::Supervised,
             )
             .await;
@@ -740,28 +809,32 @@ mod tests {
             writer.0.lock().unwrap().is_empty(),
             "no write may happen on a stale proof"
         );
+        // A refused proof is not audited as an execution (the act never happened).
+        assert!(audit.recorded().await.is_empty());
     }
 
     #[tokio::test]
     async fn live_executor_skips_a_non_executing_decision() {
         let cap = executing_cap();
         let writer = MockWriter::default();
+        let audit = MockAuditSink::accepting();
         let graph = tag_graph(false);
         let (resolver, mounts) = (IdentityResolver, StaticMountPolicy::empty());
-        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer);
+        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer, &audit);
         let written = exec
             .execute(
                 &tag_action(),
                 ActionDecision::RequireConfirmation,
                 &auto_tag_scope(),
                 &graph,
-                "org.lunaris.files",
-                false,
+                "auto-tag-by-project",
+                &ctx(),
                 BaselineMode::Supervised,
             )
             .await
             .unwrap();
         assert_eq!(written, None);
         assert!(writer.0.lock().unwrap().is_empty());
+        assert!(audit.recorded().await.is_empty(), "nothing executed, nothing audited");
     }
 }
