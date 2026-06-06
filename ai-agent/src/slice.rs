@@ -909,7 +909,7 @@ const MAX_BINDING_LEN: usize = 8192;
 /// over-long value (a query-size bound), NUL and control characters (abnormal
 /// in an id and a footgun in a literal); escapes the backslash and the single
 /// quote.
-fn escape_cypher_literal(s: &str) -> Result<String, SliceError> {
+pub(crate) fn escape_cypher_literal(s: &str) -> Result<String, SliceError> {
     if s.len() > MAX_BINDING_LEN {
         return Err(SliceError::BadBinding(s.to_string()));
     }
