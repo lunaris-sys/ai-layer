@@ -54,8 +54,9 @@ fn plan_dry_run(
     behaviour: &str,
     action: &ProposedAction,
     decision: ActionDecision,
+    tool_scope: &[String],
 ) -> Option<DryRunReport> {
-    match crate::executor::dry_run(action, decision) {
+    match crate::executor::dry_run(action, decision, tool_scope) {
         Ok(report) => report,
         Err(e) => {
             tracing::warn!(
@@ -772,7 +773,9 @@ impl<'a> Dispatcher<'a> {
                     .await
                 {
                     Ok(receipt) => {
-                        let dry_run = plan_dry_run(&behaviour, &action, receipt.decision);
+                        let tool_scope = m.tools.get(&action.tool).map(Vec::as_slice).unwrap_or(&[]);
+                        let dry_run =
+                            plan_dry_run(&behaviour, &action, receipt.decision, tool_scope);
                         let plan = plan_for(&action.tool);
                         DispatchOutcome::Decided {
                             behaviour,
@@ -1060,8 +1063,14 @@ impl<'a> Dispatcher<'a> {
                                 summary: action.summary.clone(),
                                 decision: format!("{:?}", receipt.decision),
                             });
-                            let dry_run =
-                                plan_dry_run(&behaviour, &action, receipt.decision);
+                            let tool_scope =
+                                m.tools.get(&action.tool).map(Vec::as_slice).unwrap_or(&[]);
+                            let dry_run = plan_dry_run(
+                                &behaviour,
+                                &action,
+                                receipt.decision,
+                                tool_scope,
+                            );
                             let plan = plan_for(&action.tool);
                             outcomes.push(DispatchOutcome::Decided {
                                 behaviour: behaviour.clone(),

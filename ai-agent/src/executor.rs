@@ -28,9 +28,15 @@
 //! [`DryRunReport::conditional_on_absent_edge`]: the live executor must enforce
 //! that absence atomically (a conditional create-or-conflict op), or the effect
 //! must be re-modelled as an idempotent ensure-edge whose compensation only
-//! undoes a create it actually performed. Resolving that, plus per-tool
-//! scope-value enforcement (obligation 3), is the live executor increment;
-//! nothing here executes.
+//! undoes a create it actually performed. Resolving that absence check, plus
+//! re-running the full trusted precondition proof atomically at write time
+//! (obligation 2, which the live write inherently couples to), is the live
+//! executor increment; nothing here executes.
+//!
+//! Per-tool scope-value enforcement (obligation 3) **is** done here: the planned
+//! write is checked against the behaviour's declared `graph.write` scope, so it
+//! can only ever target a relation/entity the behaviour was granted, not merely
+//! one it holds the `graph.write` tool name for.
 
 use std::collections::BTreeMap;
 
@@ -77,6 +83,17 @@ pub enum ExecError {
     /// id is unresolved.
     #[error("argument '{0}' is missing, so its node id is unresolved")]
     MissingArgument(String),
+    /// The planned write names a target entity or relation type the behaviour
+    /// did not declare in its `graph.write` tool scope. The gate enforces the
+    /// tool *name*; the executor enforces the scope *values* (obligation 3), so
+    /// a behaviour cannot write a relation/target it was not granted.
+    #[error("tool '{tool}' scope does not grant '{token}'")]
+    ScopeViolation {
+        /// The tool whose declared scope was exceeded.
+        tool: String,
+        /// The target label or relation type the scope did not name.
+        token: String,
+    },
 }
 
 /// What a dry run would do, surfaced for logging / the activity view. Holds the
@@ -126,6 +143,34 @@ fn create_is_conditional_on_absence(schema: &TrustedActionSchema) -> bool {
         }
         false
     })
+}
+
+/// Enforce the behaviour's per-tool scope *values* on a planned write
+/// (obligation 3). The gate already checked the tool name; here the concrete
+/// target and relation must be ones the behaviour declared, so a behaviour
+/// granted `graph.write: [Project, FILE_PART_OF]` cannot write some other
+/// relation or target even though it holds `graph.write`.
+///
+/// An empty scope list means the tool is granted without a finer restriction
+/// (the manifest convention), so it passes. Otherwise both the target entity's
+/// bare label and the relation type must appear in the scope list.
+fn enforce_tool_scope(write: &RelationWrite, tool: &str, scope: &[String]) -> Result<(), ExecError> {
+    if scope.is_empty() {
+        return Ok(());
+    }
+    let to_label = write
+        .to_type
+        .strip_prefix("system.")
+        .unwrap_or(&write.to_type);
+    for token in [to_label, write.relation_type.as_str()] {
+        if !scope.iter().any(|s| s == token) {
+            return Err(ExecError::ScopeViolation {
+                tool: tool.to_string(),
+                token: token.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Map a bare world-model label (`File`) to the daemon's namespaced entity type
@@ -205,11 +250,14 @@ pub(crate) fn plan_relation_write(
 ///
 /// The schema is resolved independently from the trusted registry, keyed by the
 /// same tool the gate proved (defence in depth: the executor binds to the
-/// registry, not to a caller-passed schema). Performs **no I/O**: it records
-/// what the live executor would write.
+/// registry, not to a caller-passed schema). The planned write is also checked
+/// against `tool_scope`, the behaviour's declared `graph.write` scope values
+/// (obligation 3). Performs **no I/O**: it records what the live executor would
+/// write.
 pub(crate) fn dry_run(
     action: &ProposedAction,
     decision: ActionDecision,
+    tool_scope: &[String],
 ) -> Result<Option<DryRunReport>, ExecError> {
     // Only PreviewThenExecute carries a successful predict-before-act proof
     // (the gate lifts to it solely when the world model validated this
@@ -223,6 +271,7 @@ pub(crate) fn dry_run(
     let schema =
         registry::lookup(&action.tool).ok_or_else(|| ExecError::NoRule(action.tool.clone()))?;
     let write = plan_relation_write(&schema, &action.arguments)?;
+    enforce_tool_scope(&write, &action.tool, tool_scope)?;
     let conditional_on_absent_edge = create_is_conditional_on_absence(&schema);
     Ok(Some(DryRunReport {
         write,
@@ -243,6 +292,11 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         }
+    }
+
+    /// The auto-tag behaviour's declared `graph.write` scope.
+    fn auto_tag_scope() -> Vec<String> {
+        vec!["Project".to_string(), "FILE_PART_OF".to_string()]
     }
 
     #[test]
@@ -281,12 +335,13 @@ mod tests {
     #[test]
     fn dry_run_plans_only_for_the_proven_preview_decision() {
         let action = graph_write_action(&[("file", "f1"), ("project", "p1")]);
+        let scope = auto_tag_scope();
 
         // PreviewThenExecute is the only decision carrying a successful proof, so
         // it is the only one that produces an executable write. The built-in link
         // rule is strict-create, so the plan flags that the live executor must
         // check the edge is absent (not a bare MERGE).
-        let report = dry_run(&action, ActionDecision::PreviewThenExecute)
+        let report = dry_run(&action, ActionDecision::PreviewThenExecute, &scope)
             .unwrap()
             .unwrap();
         assert_eq!(report.write.relation_type, "FILE_PART_OF");
@@ -299,12 +354,12 @@ mod tests {
         // unproven cap (operands unvalidated), Propose is manual, and Proceed is
         // not emitted by the gate. None must derive a write from the operands.
         assert_eq!(
-            dry_run(&action, ActionDecision::RequireConfirmation).unwrap(),
+            dry_run(&action, ActionDecision::RequireConfirmation, &scope).unwrap(),
             None,
             "an unproven confirmation must not yield an executable write"
         );
-        assert_eq!(dry_run(&action, ActionDecision::Propose).unwrap(), None);
-        assert_eq!(dry_run(&action, ActionDecision::Proceed).unwrap(), None);
+        assert_eq!(dry_run(&action, ActionDecision::Propose, &scope).unwrap(), None);
+        assert_eq!(dry_run(&action, ActionDecision::Proceed, &scope).unwrap(), None);
     }
 
     #[test]
@@ -315,8 +370,45 @@ mod tests {
             arguments: BTreeMap::new(),
         };
         assert_eq!(
-            dry_run(&action, ActionDecision::PreviewThenExecute),
+            dry_run(&action, ActionDecision::PreviewThenExecute, &[]),
             Err(ExecError::NoRule("fs.delete".to_string()))
         );
+    }
+
+    #[test]
+    fn dry_run_enforces_the_declared_tool_scope() {
+        let action = graph_write_action(&[("file", "f1"), ("project", "p1")]);
+
+        // A scope that grants the relation but not the target entity is refused:
+        // the executor enforces scope values (obligation 3), not just the name.
+        let scope = vec!["FILE_PART_OF".to_string()];
+        assert_eq!(
+            dry_run(&action, ActionDecision::PreviewThenExecute, &scope),
+            Err(ExecError::ScopeViolation {
+                tool: "graph.write".to_string(),
+                token: "Project".to_string(),
+            })
+        );
+
+        // A scope missing the relation type is likewise refused.
+        let scope = vec!["Project".to_string()];
+        assert_eq!(
+            dry_run(&action, ActionDecision::PreviewThenExecute, &scope),
+            Err(ExecError::ScopeViolation {
+                tool: "graph.write".to_string(),
+                token: "FILE_PART_OF".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_empty_scope_grants_without_restriction() {
+        let action = graph_write_action(&[("file", "f1"), ("project", "p1")]);
+        // The manifest convention: an empty scope list grants the tool without a
+        // finer restriction, so the write plans.
+        let report = dry_run(&action, ActionDecision::PreviewThenExecute, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.write.relation_type, "FILE_PART_OF");
     }
 }
