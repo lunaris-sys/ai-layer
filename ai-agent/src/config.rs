@@ -50,8 +50,10 @@ pub struct AgentConfig {
     /// acted on. Opt in with `[agent] executor_live = true`; the write still
     /// passes the full predict -> gate -> re-validate -> audit chain.
     ///
-    /// PREREQUISITES before relying on this in a deployment (all three are why
-    /// it defaults off and nothing flips it yet):
+    /// Status of the deployment prerequisites (it defaults off and nothing flips
+    /// it yet): (1) the execution semantics are decided, (2) the cancellation
+    /// behaviour is bounded and accepted, and only (3) full proof atomicity
+    /// remains as a hard blocker. Detail:
     ///
     /// 1. **Execution semantics (decided).** The executor fires on a proven
     ///    `PreviewThenExecute`, which in the capability model is the *Supervised*
@@ -66,14 +68,20 @@ pub struct AgentConfig {
     ///    workflow curation; it does NOT extend to `kind: agent` LLM behaviours
     ///    (which are not wired to execute) or to high-impact / external-triggered
     ///    actions (which always confirm regardless).
-    /// 2. **Cancellation.** The daemon's dispatch loop is cancellable (a config
-    ///    reload or shutdown drops an in-flight dispatch), which was safe while
-    ///    nothing executed. With this on, a reload/shutdown mid-write drops the
-    ///    write future. The write is audited *before* it is sent and the daemon's
-    ///    create is idempotent, so the mutation is durably recorded and
-    ///    reconcilable on the next run; the residual is the D-2 class of an
-    ///    already-sent write committing under a grant the reload was revoking.
-    ///    A non-cancellable live-write completion boundary is the fix.
+    /// 2. **Cancellation (bounded, accepted).** The dispatch loop stays
+    ///    cancellable (a reload/shutdown can drop an in-flight dispatch), kept on
+    ///    purpose: it aborts a long `kind: agent` loop promptly, and for the
+    ///    workflow write a *drop is the correct revocation behaviour* (a config
+    ///    change removing the grant means the write should not be forced through;
+    ///    a dropped write is not re-authorised on the next run). The write is
+    ///    pre-audited and idempotent, so if its request was already sent it is
+    ///    durably recorded and reconcilable, never lost. The write also has its
+    ///    own timeout, so a stalled knowledge socket cannot park the dispatch
+    ///    (and the daemon) waiting on it. Residual: an already-sent write can
+    ///    still commit under a just-revoked grant (the bounded D-2 class, at most
+    ///    the one in-flight event). A narrower per-write completion shield is
+    ///    possible but not clearly more correct, since forcing the write through
+    ///    a revocation is the opposite of what a revocation wants.
     /// 3. **Proof atomicity.** The executor re-validates the full proof, then
     ///    performs a separate write; the daemon enforces only endpoint existence
     ///    and edge absence atomically, not the gate's `PathUnderField`. A fact

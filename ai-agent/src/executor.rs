@@ -56,6 +56,12 @@ use crate::world::{self, Effect, EvalContext, Predicate};
 /// fail closed (the write is refused) rather than park the executor.
 const REVALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Wall-clock bound on the write itself. The daemon's dispatch loop awaits the
+/// executor, so an unbounded write against a stalled knowledge socket would
+/// block the daemon from honouring a reload or shutdown. A timed-out write fails
+/// closed (pre-audited + idempotent, so reconcilable on a later run).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The concrete relation write a proven action would perform: the namespaced
 /// endpoint entity types, their resolved node ids, and the edge type. The
 /// shape the daemon's relation-write socket expects.
@@ -123,6 +129,12 @@ pub enum ExecError {
     /// of it (the S13 audit-before-acting invariant the gate also honours).
     #[error("audit unavailable, execution refused: {0}")]
     AuditUnavailable(String),
+    /// The write did not finish within [`WRITE_TIMEOUT`]. Fail-closed so a
+    /// stalled write cannot park the executor (and the daemon's dispatch loop);
+    /// the write is pre-audited and idempotent, so it is reconcilable on a later
+    /// run rather than lost.
+    #[error("the write timed out")]
+    WriteTimeout,
 }
 
 /// A failure to persist a planned relation write.
@@ -477,12 +489,21 @@ impl<'a> LiveExecutor<'a> {
 
         // The proof still holds and the act is recorded: perform the authorised
         // write. The outcome (created vs already-present) is carried back so only
-        // a real create is ever compensated.
-        let outcome = self
-            .writer
-            .write_relation(&report.write)
-            .await
-            .map_err(|e| ExecError::Write(e.to_string()))?;
+        // a real create is ever compensated. The write is time-bounded: a stalled
+        // knowledge socket must not park the executor (and, since the daemon's
+        // dispatch loop awaits this, the whole daemon) indefinitely. A timed-out
+        // write fails closed; it is pre-audited and the daemon's create is
+        // idempotent, so it is reconcilable on a later run.
+        let outcome = match tokio::time::timeout(
+            WRITE_TIMEOUT,
+            self.writer.write_relation(&report.write),
+        )
+        .await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => return Err(ExecError::Write(e.to_string())),
+            Err(_) => return Err(ExecError::WriteTimeout),
+        };
         Ok(Some(ExecutedWrite {
             write: report.write,
             outcome,
@@ -782,6 +803,41 @@ mod tests {
             writer.0.lock().unwrap().is_empty(),
             "no write may happen when the act cannot be audited"
         );
+    }
+
+    /// A writer that never returns, to exercise the write timeout.
+    struct HangingWriter;
+    #[async_trait]
+    impl RelationWriter for HangingWriter {
+        async fn write_relation(&self, _write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_executor_times_out_a_stalled_write() {
+        let cap = executing_cap();
+        let writer = HangingWriter;
+        let audit = MockAuditSink::accepting();
+        let graph = tag_graph(false);
+        let (resolver, mounts) = (IdentityResolver, StaticMountPolicy::empty());
+        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer, &audit);
+        // Paused time auto-advances past WRITE_TIMEOUT once the write is the only
+        // thing pending, so this resolves immediately, not after a real 5s.
+        let result = exec
+            .execute(
+                &tag_action(),
+                ActionDecision::PreviewThenExecute,
+                &auto_tag_scope(),
+                &graph,
+                "auto-tag-by-project",
+                &ctx(),
+                BaselineMode::Supervised,
+            )
+            .await;
+        assert!(matches!(result, Err(ExecError::WriteTimeout)));
+        // The act was still audited before the write was attempted.
+        assert_eq!(audit.recorded().await.len(), 1);
     }
 
     #[tokio::test]
