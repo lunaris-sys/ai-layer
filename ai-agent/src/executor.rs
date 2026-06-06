@@ -132,17 +132,32 @@ pub enum ExecError {
     /// The write did not finish within [`WRITE_TIMEOUT`]. Fail-closed so a
     /// stalled write cannot park the executor (and the daemon's dispatch loop);
     /// the write is pre-audited and idempotent, so it is reconcilable on a later
-    /// run rather than lost.
+    /// run rather than lost. Commit-unknown (the request may have been sent).
     #[error("the write timed out")]
     WriteTimeout,
+    /// The write failed in a way that leaves its commit **unknown** (a transport
+    /// failure after the request may already have been sent). Distinct from
+    /// `Write` (a definite no-commit), so the outcome is reported as
+    /// indeterminate and reconciled on a later run.
+    #[error("the write outcome is unknown: {0}")]
+    WriteIndeterminate(String),
 }
 
-/// A failure to persist a planned relation write.
+/// A failure to persist a planned relation write, classified by whether the
+/// relation could have been committed.
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
-    /// The write could not be performed (daemon rejected it, or transport).
+    /// The write **definitely did not commit**: the daemon received the request
+    /// and rejected it (permission denied, endpoints not found), or the
+    /// connection failed before the request was sent.
     #[error("relation write failed: {0}")]
     Failed(String),
+    /// The write's commit is **unknown**: a transport failure after the request
+    /// may already have been sent (a dropped connection, a lost response). The
+    /// relation may or may not have been persisted, so it must not be reported
+    /// as a definite failure.
+    #[error("relation write outcome unknown: {0}")]
+    Indeterminate(String),
 }
 
 /// Whether a write created the edge or found it already present. The daemon's
@@ -501,7 +516,11 @@ impl<'a> LiveExecutor<'a> {
         .await
         {
             Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err(ExecError::Write(e.to_string())),
+            // A definite no-commit (daemon rejected, or pre-send transport).
+            Ok(Err(WriteError::Failed(e))) => return Err(ExecError::Write(e)),
+            // A commit-unknown transport failure (post-send) is preserved as
+            // indeterminate, never collapsed to a definite failure.
+            Ok(Err(WriteError::Indeterminate(e))) => return Err(ExecError::WriteIndeterminate(e)),
             Err(_) => return Err(ExecError::WriteTimeout),
         };
         Ok(Some(ExecutedWrite {

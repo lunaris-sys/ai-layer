@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use os_sdk::{RelationWriteOutcome, UnixGraphClient};
+use os_sdk::{QueryError, RelationWriteOutcome, UnixGraphClient};
 
 use crate::executor::{RelationWrite, RelationWriter, WriteError, WriteOutcome};
 use crate::seams::{GraphError, GraphHandle};
@@ -90,10 +90,62 @@ impl RelationWriter for UnixRelationWriter {
                 &write.relation_type,
             )
             .await
-            .map_err(|e| WriteError::Failed(e.to_string()))?;
+            .map_err(map_write_error)?;
         Ok(match outcome {
             RelationWriteOutcome::Created => WriteOutcome::Created,
             RelationWriteOutcome::AlreadyExists => WriteOutcome::AlreadyExists,
         })
+    }
+}
+
+/// Classify an os-sdk write error by whether the relation could have committed,
+/// conservatively: only a **reliable** definite no-commit is `Failed`, and
+/// anything that could have left a committed write upstream is `Indeterminate`.
+///
+/// `PermissionDenied` is the one reliable definite no-commit: the daemon
+/// authorises before it writes, so an auth rejection means nothing was created
+/// (and it is persistent, so reconciliation must not keep treating it as
+/// maybe-committed). Everything else is treated as commit-unknown, because the
+/// coarse `QueryError` cannot separate the phases within it: `ConnectionFailed`
+/// covers both a pre-send connect failure (no commit) and a post-send drop
+/// (unknown); `InvalidQuery` covers both a daemon `ERROR:` rejection (no commit)
+/// and an undecodable/oversized response *after* the daemon processed the
+/// request (unknown). Defaulting those to `Indeterminate` is the safe direction:
+/// a false indeterminate is reconciled by the next run's re-validation (an
+/// already-committed edge fails the `Not(EdgeExists)` proof; an absent one is
+/// re-written), whereas a false `Failed` would discard a real commit. Precise
+/// per-phase certainty needs durable operation identity (an idempotency key) and
+/// a reconciliation query, the deferred executor-design follow-up; this is the
+/// honest conservative mapping until then.
+fn map_write_error(e: QueryError) -> WriteError {
+    match e {
+        QueryError::PermissionDenied => WriteError::Failed(e.to_string()),
+        QueryError::ConnectionFailed(msg) => WriteError::Indeterminate(msg),
+        QueryError::InvalidQuery(msg) => WriteError::Indeterminate(msg),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_errors_are_classified_by_commit_certainty() {
+        // Only a reliable daemon auth rejection is a definite no-commit.
+        assert!(matches!(
+            map_write_error(QueryError::PermissionDenied),
+            WriteError::Failed(_)
+        ));
+        // A transport failure is commit-unknown (the request may have been sent).
+        assert!(matches!(
+            map_write_error(QueryError::ConnectionFailed("reset".into())),
+            WriteError::Indeterminate(_)
+        ));
+        // An InvalidQuery conflates a daemon rejection with a post-commit decode
+        // failure, so it is conservatively commit-unknown, never a false Failed.
+        assert!(matches!(
+            map_write_error(QueryError::InvalidQuery("unexpected response".into())),
+            WriteError::Indeterminate(_)
+        ));
     }
 }

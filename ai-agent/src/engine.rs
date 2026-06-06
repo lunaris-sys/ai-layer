@@ -896,14 +896,17 @@ impl<'a> Dispatcher<'a> {
             // A non-executing decision (the executor planned nothing): nothing
             // to record beyond the decision itself.
             Ok(None) => None,
-            // A timed-out write may have committed, so it is indeterminate, not a
-            // failure: mapping it to Failed would discard the created/exists
-            // signal for a write that did persist. The next run's re-validation
-            // reconciles it.
-            Err(e @ crate::executor::ExecError::WriteTimeout) => {
+            // A timed-out or post-send-failed write may have committed, so it is
+            // indeterminate, not a failure: mapping it to Failed would discard the
+            // created/exists signal for a write that did persist. The next run's
+            // re-validation reconciles it.
+            Err(
+                e @ (crate::executor::ExecError::WriteTimeout
+                | crate::executor::ExecError::WriteIndeterminate(_)),
+            ) => {
                 tracing::warn!(
                     behaviour = %behaviour,
-                    "live executor write timed out (commit unknown): {e}"
+                    "live executor write outcome unknown (may have committed): {e}"
                 );
                 Some(ExecutionResult::Indeterminate(e.to_string()))
             }
@@ -3419,6 +3422,40 @@ trigger:
         match outcomes.as_slice() {
             [DispatchOutcome::Decided { executed: Some(ExecutionResult::Indeterminate(_)), .. }] => {}
             other => panic!("a timed-out write must be Indeterminate, not Failed: {other:?}"),
+        }
+    }
+
+    /// A writer whose request may have been sent before the connection failed:
+    /// commit-unknown, so the outcome must be Indeterminate, not Failed.
+    struct PostSendFailWriter;
+    #[async_trait::async_trait]
+    impl RelationWriter for PostSendFailWriter {
+        async fn write_relation(&self, _write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+            Err(WriteError::Indeterminate("connection dropped after send".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_post_send_write_failure_is_indeterminate_not_failed() {
+        let behaviours = [loaded(LIVE_AUTO_TAG, Status::Enabled)];
+        let handlers = registry(Box::new(ProvableTag));
+        let cap = live_cap();
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = TagGraph;
+        let resolver = IdResolver;
+        let mounts = StaticMountPolicy::empty();
+        let writer = PostSendFailWriter;
+
+        let g = Gate::new(&cap, &audit, &obs, &resolver, &mounts);
+        let executor = LiveExecutor::new(&cap, &resolver, &mounts, &writer, &audit);
+        let d = Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, g, None, &TEST_CLOCK)
+            .with_executor(executor);
+
+        let outcomes = d.dispatch(&event("/proj/a.rs")).await;
+        match outcomes.as_slice() {
+            [DispatchOutcome::Decided { executed: Some(ExecutionResult::Indeterminate(_)), .. }] => {}
+            other => panic!("a post-send write failure must be Indeterminate: {other:?}"),
         }
     }
 
