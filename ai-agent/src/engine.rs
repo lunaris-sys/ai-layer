@@ -3309,7 +3309,7 @@ trigger:
     struct RecordingWriter(std::sync::Mutex<Vec<RelationWrite>>);
     #[async_trait::async_trait]
     impl RelationWriter for RecordingWriter {
-        async fn write_relation(&self, write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+        async fn write_relation(&self, write: &RelationWrite, _op_id: &str) -> Result<WriteOutcome, WriteError> {
             self.0.lock().unwrap().push(write.clone());
             Ok(WriteOutcome::Created)
         }
@@ -3385,7 +3385,7 @@ trigger:
     struct FailingWriter;
     #[async_trait::async_trait]
     impl RelationWriter for FailingWriter {
-        async fn write_relation(&self, _write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+        async fn write_relation(&self, _write: &RelationWrite, _op_id: &str) -> Result<WriteOutcome, WriteError> {
             Err(WriteError::Failed("daemon unreachable".to_string()))
         }
     }
@@ -3394,7 +3394,7 @@ trigger:
     struct HangingWriter;
     #[async_trait::async_trait]
     impl RelationWriter for HangingWriter {
-        async fn write_relation(&self, _write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+        async fn write_relation(&self, _write: &RelationWrite, _op_id: &str) -> Result<WriteOutcome, WriteError> {
             std::future::pending().await
         }
     }
@@ -3430,7 +3430,7 @@ trigger:
     struct PostSendFailWriter;
     #[async_trait::async_trait]
     impl RelationWriter for PostSendFailWriter {
-        async fn write_relation(&self, _write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+        async fn write_relation(&self, _write: &RelationWrite, _op_id: &str) -> Result<WriteOutcome, WriteError> {
             Err(WriteError::Indeterminate("connection dropped after send".to_string()))
         }
     }

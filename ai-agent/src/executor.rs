@@ -186,7 +186,14 @@ pub trait RelationWriter: Send + Sync {
     /// Persist the relation, reporting whether it created the edge or found it
     /// already present. Idempotent at the daemon (a strict conditional create),
     /// so a transport retry re-confirms (`AlreadyExists`) rather than duplicates.
-    async fn write_relation(&self, write: &RelationWrite) -> Result<WriteOutcome, WriteError>;
+    /// `op_id` is the durable operation identity persisted on the edge, so a
+    /// commit-unknown write can later be reconciled by reading whether this
+    /// op's edge exists.
+    async fn write_relation(
+        &self,
+        write: &RelationWrite,
+        op_id: &str,
+    ) -> Result<WriteOutcome, WriteError>;
 }
 
 /// A write the live executor performed: the relation and whether it was created
@@ -275,6 +282,35 @@ fn enforce_tool_scope(write: &RelationWrite, tool: &str, scope: &[String]) -> Re
         }
     }
     Ok(())
+}
+
+/// Derive a stable, collision-resistant operation id for a write, from the
+/// decision identity (the correlation id, `event.id:behaviour`) and the concrete
+/// write. A crash-replay of the *same* decision yields the same id (so the daemon
+/// can recognise it), while a genuinely new decision with the same operands does
+/// not. Length-delimited so distinct field boundaries cannot collide, hashed with
+/// SHA-256 and hex-encoded (64 chars, within the daemon's `op_id` bound).
+fn derive_op_id(correlation_id: &str, write: &RelationWrite) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [
+        correlation_id,
+        &write.from_type,
+        &write.from_id,
+        &write.to_type,
+        &write.to_id,
+        &write.relation_type,
+    ] {
+        h.update((part.len() as u64).to_le_bytes());
+        h.update(part.as_bytes());
+    }
+    let digest = h.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// Map a bare world-model label (`File`) to the daemon's namespaced entity type
@@ -503,15 +539,18 @@ impl<'a> LiveExecutor<'a> {
             .map_err(|e| ExecError::AuditUnavailable(e.to_string()))?;
 
         // The proof still holds and the act is recorded: perform the authorised
-        // write. The outcome (created vs already-present) is carried back so only
-        // a real create is ever compensated. The write is time-bounded: a stalled
-        // knowledge socket must not park the executor (and, since the daemon's
-        // dispatch loop awaits this, the whole daemon) indefinitely. A timed-out
-        // write fails closed; it is pre-audited and the daemon's create is
-        // idempotent, so it is reconcilable on a later run.
+        // write. A durable operation id, derived from the decision identity (the
+        // correlation id) and the concrete write, is persisted on the edge, so a
+        // commit-unknown write can be reconciled by reading whether THIS op's
+        // edge exists. The outcome (created vs already-present) is carried back so
+        // only a real create is ever compensated. The write is time-bounded: a
+        // stalled knowledge socket must not park the executor (and, since the
+        // daemon's dispatch loop awaits this, the whole daemon) indefinitely. A
+        // timed-out write fails closed; it is pre-audited, so reconcilable later.
+        let op_id = derive_op_id(ctx.correlation_id, &report.write);
         let outcome = match tokio::time::timeout(
             WRITE_TIMEOUT,
-            self.writer.write_relation(&report.write),
+            self.writer.write_relation(&report.write, &op_id),
         )
         .await
         {
@@ -611,6 +650,30 @@ mod tests {
         );
         assert_eq!(dry_run(&action, ActionDecision::Propose, &scope).unwrap(), None);
         assert_eq!(dry_run(&action, ActionDecision::Proceed, &scope).unwrap(), None);
+    }
+
+    #[test]
+    fn op_id_is_deterministic_and_distinguishes_decisions() {
+        let write = RelationWrite {
+            from_type: "system.File".into(),
+            from_id: "f1".into(),
+            to_type: "system.Project".into(),
+            to_id: "p1".into(),
+            relation_type: "FILE_PART_OF".into(),
+        };
+        // Same decision + write -> same id (so a replay is recognisable).
+        assert_eq!(derive_op_id("e1:auto-tag", &write), derive_op_id("e1:auto-tag", &write));
+        // A different decision -> a different id.
+        assert_ne!(derive_op_id("e1:auto-tag", &write), derive_op_id("e2:auto-tag", &write));
+        // A different operand -> a different id (length-delimited, no boundary
+        // collision).
+        let mut other = write.clone();
+        other.to_id = "p2".into();
+        assert_ne!(derive_op_id("e1:auto-tag", &write), derive_op_id("e1:auto-tag", &other));
+        // 64 hex chars (SHA-256), within the daemon's op_id bound.
+        let id = derive_op_id("e1:auto-tag", &write);
+        assert_eq!(id.len(), 64);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -746,7 +809,7 @@ mod tests {
 
     #[async_trait]
     impl RelationWriter for MockWriter {
-        async fn write_relation(&self, write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+        async fn write_relation(&self, write: &RelationWrite, _op_id: &str) -> Result<WriteOutcome, WriteError> {
             self.0.lock().unwrap().push(write.clone());
             Ok(WriteOutcome::Created)
         }
@@ -828,7 +891,7 @@ mod tests {
     struct HangingWriter;
     #[async_trait]
     impl RelationWriter for HangingWriter {
-        async fn write_relation(&self, _write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+        async fn write_relation(&self, _write: &RelationWrite, _op_id: &str) -> Result<WriteOutcome, WriteError> {
             std::future::pending().await
         }
     }

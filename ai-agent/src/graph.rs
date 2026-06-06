@@ -80,7 +80,11 @@ impl UnixRelationWriter {
 
 #[async_trait::async_trait]
 impl RelationWriter for UnixRelationWriter {
-    async fn write_relation(&self, write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+    async fn write_relation(
+        &self,
+        write: &RelationWrite,
+        op_id: &str,
+    ) -> Result<WriteOutcome, WriteError> {
         let outcome = UnixGraphClient::new(self.socket_path.clone())
             .create_relation(
                 &write.from_type,
@@ -88,6 +92,7 @@ impl RelationWriter for UnixRelationWriter {
                 &write.to_type,
                 &write.to_id,
                 &write.relation_type,
+                op_id,
             )
             .await
             .map_err(map_write_error)?;
