@@ -868,6 +868,7 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
             reason,
             audit_index,
             plan,
+            dry_run,
         } => {
             tracing::info!(
                 behaviour = %behaviour,
@@ -887,6 +888,18 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
                     effects = ?plan.effects,
                     undo = ?plan.compensation,
                     "decision execution plan"
+                );
+            }
+            // The dry-run executor's concrete planned write and its strict-create
+            // absence condition, for a proven PreviewThenExecute decision.
+            // Content-bearing (it holds the operand ids), so this is the local
+            // activity log, not the content-free audit.
+            if let Some(report) = dry_run {
+                tracing::info!(
+                    behaviour = %behaviour,
+                    write = ?report.write,
+                    conditional_on_absent_edge = report.conditional_on_absent_edge,
+                    "decision dry-run write plan"
                 );
             }
         }

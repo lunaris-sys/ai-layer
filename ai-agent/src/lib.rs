@@ -13,6 +13,7 @@ pub mod behaviour;
 pub mod compaction;
 pub mod config;
 pub mod engine;
+pub mod executor;
 pub mod gate;
 pub mod graph;
 pub mod handlers;

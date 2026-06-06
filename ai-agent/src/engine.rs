@@ -30,6 +30,7 @@ use lunaris_ai_classifier::{screen, ClassifierPolicy, InjectionClassifier, Verdi
 use crate::behaviour::{Behaviour, BehaviourKind, ReadScope};
 use crate::compaction::{self, CompactionPolicy, TranscriptEntry};
 use crate::gate::{ActionContext, DecisionReason, Gate, GateError, ProposedAction};
+use crate::executor::DryRunReport;
 use crate::loader::LoadedBehaviour;
 use crate::registry::plan_for;
 /// Re-exported so the public [`DispatchOutcome::Decided`] can carry a plan while
@@ -43,6 +44,28 @@ use crate::seams::{AgentEvent, Clock, DeniedGraph, GraphHandle, TriggerSource};
 /// the agent acts as itself, and execution is capped to confirmation
 /// regardless, so this never widens authority.
 const AGENT_APP_ID: &str = "org.lunaris.agent";
+
+/// Compute the dry-run executor's plan for a gate decision, to carry on the
+/// dispatch outcome (the bin logs the successful plan from there). Suggest-mode:
+/// this performs no write. The manual `Propose` flow plans nothing; an action
+/// the executor cannot plan is warned at the source, never guessed, and yields
+/// `None`.
+fn plan_dry_run(
+    behaviour: &str,
+    action: &ProposedAction,
+    decision: ActionDecision,
+) -> Option<DryRunReport> {
+    match crate::executor::dry_run(action, decision) {
+        Ok(report) => report,
+        Err(e) => {
+            tracing::warn!(
+                behaviour = %behaviour,
+                "dry-run executor could not plan write: {e}"
+            );
+            None
+        }
+    }
+}
 
 /// Wall-clock bound on a single workflow handler run. A handler that blocks
 /// or runs away is abandoned with a Failed outcome rather than stalling the
@@ -156,6 +179,16 @@ pub enum DispatchOutcome {
         /// registered action; `None` for an unregistered tool. Surfaced so the
         /// decision's concrete effect and its undo are visible (logged today).
         plan: Option<ExecutionPlan>,
+        /// The dry-run executor's plan for this decision: the concrete relation
+        /// write it would perform plus its strict-create condition. `Some` only
+        /// for a proven `PreviewThenExecute` whose action the executor can plan
+        /// (an unproven `RequireConfirmation`, the manual `Propose`, or an
+        /// unplannable action yields `None`). This is a non-authoritative record
+        /// for the activity/preview surface: a live executor must NOT write from
+        /// it but re-run the full trusted precondition proof atomically at write
+        /// time (obligation 2), since the report does not carry the point-in-time
+        /// preconditions (e.g. `PathUnderField`) that justified the lift.
+        dry_run: Option<DryRunReport>,
     },
     /// The handler reached a terminal condition with no action.
     Terminal {
@@ -739,6 +772,7 @@ impl<'a> Dispatcher<'a> {
                     .await
                 {
                     Ok(receipt) => {
+                        let dry_run = plan_dry_run(&behaviour, &action, receipt.decision);
                         let plan = plan_for(&action.tool);
                         DispatchOutcome::Decided {
                             behaviour,
@@ -747,6 +781,7 @@ impl<'a> Dispatcher<'a> {
                             reason: receipt.reason,
                             audit_index: receipt.audit_index,
                             plan,
+                            dry_run,
                         }
                     }
                     Err(e) => DispatchOutcome::Refused {
@@ -1025,6 +1060,8 @@ impl<'a> Dispatcher<'a> {
                                 summary: action.summary.clone(),
                                 decision: format!("{:?}", receipt.decision),
                             });
+                            let dry_run =
+                                plan_dry_run(&behaviour, &action, receipt.decision);
                             let plan = plan_for(&action.tool);
                             outcomes.push(DispatchOutcome::Decided {
                                 behaviour: behaviour.clone(),
@@ -1033,6 +1070,7 @@ impl<'a> Dispatcher<'a> {
                                 reason: receipt.reason,
                                 audit_index: receipt.audit_index,
                                 plan,
+                                dry_run,
                             });
                             ProgressKey::Accepted(tool_name, summary_text)
                         }
@@ -1582,6 +1620,7 @@ tools:
                 reason: DecisionReason::mode(),
                 audit_index: 0,
                 plan: plan_for("graph.write"),
+                dry_run: None,
             }
         );
         let recorded = audit.recorded().await;
@@ -1712,6 +1751,7 @@ tools:
                 reason: DecisionReason::external(),
                 audit_index: 0,
                 plan: plan_for("graph.write"),
+                dry_run: None,
             }
         );
     }
