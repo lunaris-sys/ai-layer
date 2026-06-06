@@ -39,12 +39,21 @@
 //! one it holds the `graph.write` tool name for.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
-use lunaris_ai_core::capability::ActionDecision;
+use async_trait::async_trait;
+use lunaris_ai_core::capability::{ActionDecision, BaselineMode, Capability};
 
-use crate::gate::ProposedAction;
+use crate::gate::{resolved_action_kind, ProposedAction};
 use crate::registry::{self, TrustedActionSchema};
-use crate::world::{Effect, Predicate};
+use crate::seams::GraphHandle;
+use crate::slice::{build_slice_trusted, MountPolicy, PathResolver};
+use crate::world::{self, Effect, EvalContext, Predicate};
+
+/// Wall-clock bound on the live re-validation read (graph slice + path
+/// resolution), mirroring the gate's proof timeout. A stalled dependency must
+/// fail closed (the write is refused) rather than park the executor.
+const REVALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The concrete relation write a proven action would perform: the namespaced
 /// endpoint entity types, their resolved node ids, and the edge type. The
@@ -94,6 +103,40 @@ pub enum ExecError {
         /// The target label or relation type the scope did not name.
         token: String,
     },
+    /// The predict-before-act proof no longer holds against the current graph:
+    /// a precondition went stale between the gate decision and the write (a node
+    /// removed, a path moved, the edge created concurrently). The write is
+    /// refused fail-closed rather than acting on a stale proof.
+    #[error("the action's proof no longer holds against the current graph")]
+    ProofStale,
+    /// The write itself failed at the graph boundary.
+    #[error("write failed: {0}")]
+    Write(String),
+    /// The re-validation read (graph slice + path resolution) did not finish in
+    /// time, so the proof could not be re-established. Fail-closed: a stalled
+    /// knowledge socket or a slow path lookup must not park the executor.
+    #[error("re-validation timed out before the write")]
+    RevalidationTimeout,
+}
+
+/// A failure to persist a planned relation write.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteError {
+    /// The write could not be performed (daemon rejected it, or transport).
+    #[error("relation write failed: {0}")]
+    Failed(String),
+}
+
+/// The seam through which the live executor performs an authorised write. The
+/// production impl wraps the os-sdk graph write client (the knowledge daemon's
+/// write socket); tests inject a mock that records the write without I/O. Kept
+/// separate from the read-only [`GraphHandle`] so the proof path can never write
+/// and a writer is only ever reached after a re-validated proof.
+#[async_trait]
+pub trait RelationWriter: Send + Sync {
+    /// Persist the relation. Idempotent at the daemon (MERGE), so a transport
+    /// retry re-confirms rather than duplicates.
+    async fn write_relation(&self, write: &RelationWrite) -> Result<(), WriteError>;
 }
 
 /// What a dry run would do, surfaced for logging / the activity view. Holds the
@@ -279,6 +322,115 @@ pub(crate) fn dry_run(
     }))
 }
 
+/// The live action executor: re-validates a proven decision against the current
+/// graph (obligation 2) and performs the authorised write through a
+/// [`RelationWriter`].
+///
+/// It holds the long-lived collaborators; [`execute`](LiveExecutor::execute)
+/// takes the per-call decision and the behaviour-scoped graph handle, mirroring
+/// how the gate is structured. The capability, path, and mount collaborators are
+/// the SAME the gate proved with, so the re-validation classifies and resolves
+/// identically.
+pub struct LiveExecutor<'a> {
+    capability: &'a Capability,
+    paths: &'a dyn PathResolver,
+    mounts: &'a dyn MountPolicy,
+    writer: &'a dyn RelationWriter,
+}
+
+impl<'a> LiveExecutor<'a> {
+    /// Build a live executor over its collaborators.
+    pub fn new(
+        capability: &'a Capability,
+        paths: &'a dyn PathResolver,
+        mounts: &'a dyn MountPolicy,
+        writer: &'a dyn RelationWriter,
+    ) -> Self {
+        Self {
+            capability,
+            paths,
+            mounts,
+            writer,
+        }
+    }
+
+    /// Execute a gated decision: derive the planned write (only for a proven
+    /// `PreviewThenExecute`, with scope enforced), re-run the full trusted proof
+    /// against the CURRENT graph, and write only if it still holds. Returns the
+    /// write performed, `None` for a non-executable decision, or an
+    /// [`ExecError`] (the proof went stale, the re-validation timed out, scope
+    /// was exceeded, or the write failed). The graph handle is the
+    /// behaviour-scoped one, so the re-validation reads no more than the
+    /// behaviour may.
+    ///
+    /// The re-validation **narrows** the staleness window but does not yet make
+    /// the check atomic with the write (obligation 2 is not fully closed here): a
+    /// `PathUnderField` / `Not(EdgeExists)` fact can still change between the
+    /// re-check and the writer's `MERGE`, which idempotently succeeds even if the
+    /// edge already exists. Closing it fully needs a daemon-side conditional
+    /// create-or-conflict that reports whether it actually created the edge (so
+    /// compensation never retracts a pre-existing one); that daemon op is the
+    /// next increment and is why nothing wires this into a live run yet.
+    pub async fn execute(
+        &self,
+        action: &ProposedAction,
+        decision: ActionDecision,
+        tool_scope: &[String],
+        graph: &dyn GraphHandle,
+        app_id: &str,
+        external_trigger: bool,
+        ceiling: BaselineMode,
+    ) -> Result<Option<RelationWrite>, ExecError> {
+        // Plan: only a proven PreviewThenExecute yields a write, and the planned
+        // write is checked against the behaviour's declared scope (obligation 3).
+        let Some(report) = dry_run(action, decision, tool_scope)? else {
+            return Ok(None);
+        };
+
+        // Re-run the trusted proof against the live graph, right before the
+        // write, so a precondition that went stale since the gate decision (a
+        // node removed, the file moved out from under the project root, the edge
+        // created concurrently) refuses the write. The schema and the slice are
+        // rebuilt from the trusted registry, never the proposal. The read is
+        // time-bounded (like the gate's proof): a stalled knowledge socket or a
+        // slow path lookup fails closed rather than parking the executor.
+        let trusted = registry::lookup(&action.tool)
+            .ok_or_else(|| ExecError::NoRule(action.tool.clone()))?;
+        let slice = tokio::time::timeout(
+            REVALIDATION_TIMEOUT,
+            build_slice_trusted(
+                &trusted,
+                &action.tool,
+                &action.arguments,
+                graph,
+                self.paths,
+                self.mounts,
+            ),
+        )
+        .await
+        .map_err(|_| ExecError::RevalidationTimeout)?;
+        let (state, bindings) = slice.map_err(|_| ExecError::ProofStale)?;
+        let eval = EvalContext {
+            capability: self.capability,
+            action_id: &action.tool,
+            app_id,
+            action_kind: resolved_action_kind(&action.tool),
+            external_trigger,
+            ceiling,
+        };
+        if !world::predict(trusted.schema(), &bindings, &state, &eval).is_valid() {
+            return Err(ExecError::ProofStale);
+        }
+
+        // The proof still holds: perform the authorised write.
+        self.writer
+            .write_relation(&report.write)
+            .await
+            .map_err(|e| ExecError::Write(e.to_string()))?;
+        Ok(Some(report.write))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +562,168 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(report.write.relation_type, "FILE_PART_OF");
+    }
+
+    // ---- LiveExecutor: obligation-2 re-validation + write ----
+
+    use crate::seams::GraphError;
+    use crate::slice::{SliceError, StaticMountPolicy};
+    use lunaris_ai_core::capability::{AccessTier, ActionPermissions};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// A graph returning canned rows when the query contains a needle (the same
+    /// shape the gate's proof tests use).
+    struct MockGraph(Vec<(&'static str, Vec<HashMap<String, serde_json::Value>>)>);
+
+    #[async_trait]
+    impl GraphHandle for MockGraph {
+        async fn query(
+            &self,
+            cypher: &str,
+        ) -> Result<Vec<HashMap<String, serde_json::Value>>, GraphError> {
+            for (needle, rows) in &self.0 {
+                if cypher.contains(needle) {
+                    return Ok(rows.clone());
+                }
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    /// Accepts an already-canonical absolute path as itself.
+    struct IdentityResolver;
+    impl PathResolver for IdentityResolver {
+        fn resolve(&self, raw: &str) -> Result<String, SliceError> {
+            if raw.starts_with('/') {
+                Ok(raw.to_string())
+            } else {
+                Err(SliceError::PathResolve {
+                    raw: raw.to_string(),
+                    reason: "not absolute".to_string(),
+                })
+            }
+        }
+    }
+
+    fn row(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    /// The graph for tagging `/proj/a.rs` (under `/proj`) to project `p1`, with
+    /// the `FILE_PART_OF` edge present or not.
+    fn tag_graph(linked: bool) -> MockGraph {
+        MockGraph(vec![
+            (
+                "n:File {id: '/proj/a.rs'}",
+                vec![row(&[("id", "/proj/a.rs".into()), ("path", "/proj/a.rs".into())])],
+            ),
+            (
+                "n:Project {id: 'p1'}",
+                vec![row(&[("id", "p1".into()), ("root_path", "/proj".into())])],
+            ),
+            (
+                "count(*) AS cnt",
+                vec![row(&[("cnt", serde_json::Value::from(i64::from(linked)))])],
+            ),
+        ])
+    }
+
+    fn tag_action() -> ProposedAction {
+        graph_write_action(&[("file", "/proj/a.rs"), ("project", "p1")])
+    }
+
+    fn executing_cap() -> Capability {
+        Capability::new(
+            AccessTier::Full,
+            ActionPermissions::new(BaselineMode::Suggest, ["org.lunaris.files"]),
+        )
+    }
+
+    /// Records each write without performing I/O.
+    #[derive(Default)]
+    struct MockWriter(Mutex<Vec<RelationWrite>>);
+
+    #[async_trait]
+    impl RelationWriter for MockWriter {
+        async fn write_relation(&self, write: &RelationWrite) -> Result<(), WriteError> {
+            self.0.lock().unwrap().push(write.clone());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn live_executor_writes_a_revalidated_proof() {
+        let cap = executing_cap();
+        let writer = MockWriter::default();
+        let graph = tag_graph(false); // file under root, not yet linked
+        let (resolver, mounts) = (IdentityResolver, StaticMountPolicy::empty());
+        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer);
+        let written = exec
+            .execute(
+                &tag_action(),
+                ActionDecision::PreviewThenExecute,
+                &auto_tag_scope(),
+                &graph,
+                "org.lunaris.files",
+                false,
+                BaselineMode::Supervised,
+            )
+            .await
+            .unwrap();
+        assert_eq!(written.unwrap().relation_type, "FILE_PART_OF");
+        let recorded = writer.0.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one write performed");
+        assert_eq!(recorded[0].to_type, "system.Project");
+        assert_eq!(recorded[0].from_id, "/proj/a.rs");
+    }
+
+    #[tokio::test]
+    async fn live_executor_refuses_a_stale_proof() {
+        let cap = executing_cap();
+        let writer = MockWriter::default();
+        // The edge already exists, so Not(EdgeExists) fails: the proof is stale.
+        let graph = tag_graph(true);
+        let (resolver, mounts) = (IdentityResolver, StaticMountPolicy::empty());
+        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer);
+        let result = exec
+            .execute(
+                &tag_action(),
+                ActionDecision::PreviewThenExecute,
+                &auto_tag_scope(),
+                &graph,
+                "org.lunaris.files",
+                false,
+                BaselineMode::Supervised,
+            )
+            .await;
+        assert!(matches!(result, Err(ExecError::ProofStale)));
+        assert!(
+            writer.0.lock().unwrap().is_empty(),
+            "no write may happen on a stale proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_executor_skips_a_non_executing_decision() {
+        let cap = executing_cap();
+        let writer = MockWriter::default();
+        let graph = tag_graph(false);
+        let (resolver, mounts) = (IdentityResolver, StaticMountPolicy::empty());
+        let exec = LiveExecutor::new(&cap, &resolver, &mounts, &writer);
+        let written = exec
+            .execute(
+                &tag_action(),
+                ActionDecision::RequireConfirmation,
+                &auto_tag_scope(),
+                &graph,
+                "org.lunaris.files",
+                false,
+                BaselineMode::Supervised,
+            )
+            .await
+            .unwrap();
+        assert_eq!(written, None);
+        assert!(writer.0.lock().unwrap().is_empty());
     }
 }

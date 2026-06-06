@@ -339,20 +339,15 @@ impl<'a> Gate<'a> {
         let schema_reversible = registry::lookup(&action.tool).map(|t| t.is_reversible());
 
         // Classify the proposed tool with the shared always-confirm classifier
-        // (the same one MCP dispatch uses) — never a risk class taken from the
-        // proposal. A tool already high-impact by name keeps that specific
-        // class; otherwise a registered-but-irreversible schema escalates to
-        // `Irreversible` (also high-impact), so an irreversible action always
-        // requires confirmation in EVERY mode, not only the executing one. An
-        // unregistered tool stays Ordinary and is held back instead by the lift
-        // below, which needs a proof it cannot get. Combine with the mode
-        // (ceiling ∧ grant) and the external-trigger override.
-        let base_kind = action_kind_for_tool(&action.tool);
-        let kind = if !base_kind.always_requires_confirmation() && schema_reversible == Some(false) {
-            ActionKind::Irreversible
-        } else {
-            base_kind
-        };
+        // (the same one MCP dispatch and the live executor use) — never a risk
+        // class taken from the proposal. A tool already high-impact by name keeps
+        // that specific class; otherwise a registered-but-irreversible schema
+        // escalates to `Irreversible` (also high-impact), so an irreversible
+        // action always requires confirmation in EVERY mode, not only the
+        // executing one. An unregistered tool stays Ordinary and is held back
+        // instead by the lift below, which needs a proof it cannot get. Combine
+        // with the mode (ceiling ∧ grant) and the external-trigger override.
+        let kind = resolved_action_kind(&action.tool);
         let decision =
             self.capability
                 .decide_for_behaviour(ctx.app_id, kind, ctx.external_trigger, ceiling);
@@ -527,6 +522,21 @@ impl<'a> Gate<'a> {
 /// `always_requires_confirmation()` is true. Generic command execution has
 /// no narrower kind — it maps to [`ActionKind::ElevatedPrivilege`], which
 /// (correctly) forces confirmation.
+/// Resolve an action's risk class for a tool: the name-based class, escalated to
+/// `Irreversible` when the registry-resolved schema has no derivable
+/// compensation (so an irreversible action always confirms). Shared by the gate
+/// decision and the live executor's re-validation, so both classify a tool
+/// identically and the executor cannot under-classify what the gate proved.
+pub(crate) fn resolved_action_kind(tool: &str) -> ActionKind {
+    let base_kind = action_kind_for_tool(tool);
+    let schema_reversible = registry::lookup(tool).map(|t| t.is_reversible());
+    if !base_kind.always_requires_confirmation() && schema_reversible == Some(false) {
+        ActionKind::Irreversible
+    } else {
+        base_kind
+    }
+}
+
 fn action_kind_for_tool(tool: &str) -> ActionKind {
     match AlwaysConfirm::classify(tool) {
         None => ActionKind::Ordinary,

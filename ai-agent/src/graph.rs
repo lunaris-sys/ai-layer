@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use os_sdk::UnixGraphClient;
 
+use crate::executor::{RelationWrite, RelationWriter, WriteError};
 use crate::seams::{GraphError, GraphHandle};
 
 /// The knowledge daemon's query socket. The daemon resolves the real path
@@ -52,5 +53,43 @@ impl GraphHandle for UnixGraph {
             .query_rows(cypher)
             .await
             .map_err(|e| GraphError::Failed(e.to_string()))
+    }
+}
+
+/// Production [`RelationWriter`]: writes through the knowledge daemon's write
+/// socket via `os_sdk::UnixGraphClient::create_relation`.
+///
+/// Like [`UnixGraph`], each write uses a fresh client (fresh connection); the
+/// agent's write rate is low. The daemon authorises the relation against the
+/// agent's permission profile and persists it idempotently, so a retry after a
+/// transport failure re-confirms the edge rather than duplicating it.
+pub struct UnixRelationWriter {
+    socket_path: String,
+}
+
+impl UnixRelationWriter {
+    /// Build a relation writer for the given daemon write socket (the same
+    /// socket path as the query socket; the daemon multiplexes read and write
+    /// modes on it).
+    pub fn new(socket_path: impl Into<String>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl RelationWriter for UnixRelationWriter {
+    async fn write_relation(&self, write: &RelationWrite) -> Result<(), WriteError> {
+        UnixGraphClient::new(self.socket_path.clone())
+            .create_relation(
+                &write.from_type,
+                &write.from_id,
+                &write.to_type,
+                &write.to_id,
+                &write.relation_type,
+            )
+            .await
+            .map_err(|e| WriteError::Failed(e.to_string()))
     }
 }
