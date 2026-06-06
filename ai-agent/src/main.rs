@@ -23,10 +23,13 @@ use tokio::sync::watch;
 
 use lunaris_ai_agent::behaviour::{BehaviourKind, ReadScope};
 use lunaris_ai_agent::config::{AgentConfig, ProviderSettings};
-use lunaris_ai_agent::engine::{reads_satisfied, DispatchOutcome, Dispatcher, ScreeningMode};
+use lunaris_ai_agent::engine::{
+    reads_satisfied, DispatchOutcome, Dispatcher, ExecutionResult, ScreeningMode,
+};
 use lunaris_ai_agent::gate::Gate;
 use lunaris_ai_agent::slice::{FsPathResolver, ProcMountsPolicy};
-use lunaris_ai_agent::graph::{UnixGraph, DEFAULT_GRAPH_SOCKET};
+use lunaris_ai_agent::executor::LiveExecutor;
+use lunaris_ai_agent::graph::{UnixGraph, UnixRelationWriter, DEFAULT_GRAPH_SOCKET};
 use lunaris_ai_agent::handlers::builtin_handlers;
 use lunaris_ai_agent::loader::{load, BehaviourSource};
 use lunaris_ai_agent::seams::{AgentEvent, NullObserver, SystemClock, TriggerSource};
@@ -542,6 +545,12 @@ async fn run(
         let paths = FsPathResolver;
         let mounts = ProcMountsPolicy;
         let clock = SystemClock;
+        // The relation writer for the live executor, present only when the
+        // config opts in (`[agent] executor_live`). Built once per config epoch
+        // so the dispatcher (rebuilt per provider epoch below) can borrow it;
+        // `None` keeps the daemon in suggest-mode (nothing is ever written).
+        let relation_writer =
+            config.executor_live.then(|| UnixRelationWriter::new(graph_socket()));
         let needs_provider = outcome.loaded.iter().any(|b| {
             agent_needs_provider(
                 b.status.is_enabled(),
@@ -649,10 +658,21 @@ async fn run(
             // S17: external-content screening mode, re-applied per epoch (the
             // dispatcher is rebuilt on reload/provider recovery); the classifier
             // itself is the process-lived startup resource owned by `main`.
-            let dispatcher =
+            let mut dispatcher =
                 Dispatcher::new(&outcome.loaded, handlers, graph, read_tier, gate, provider, &clock)
                     .with_screening_mode(screening.clone())
                     .with_screen_gate(Arc::clone(&screen_gate));
+            // Opt into executing when configured: the executor shares the gate's
+            // capability/path/mount/audit collaborators, so it re-validates and
+            // audits a proven write identically to the proof the gate ran.
+            if let Some(writer) = relation_writer.as_ref() {
+                dispatcher = dispatcher
+                    .with_executor(LiveExecutor::new(&capability, &paths, &mounts, writer, audit));
+                tracing::warn!(
+                    "executor enabled: proven workflow decisions will write to the graph. \
+                     Dispatch is still cancellable on reload/shutdown; see [agent] executor_live."
+                );
+            }
 
             if runnable > 0 {
                 tracing::info!(runnable, "starting agent");
@@ -869,6 +889,7 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
             audit_index,
             plan,
             dry_run,
+            executed,
         } => {
             tracing::info!(
                 behaviour = %behaviour,
@@ -901,6 +922,22 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
                     conditional_on_absent_edge = report.conditional_on_absent_edge,
                     "decision dry-run write plan"
                 );
+            }
+            // The live executor's result, when the daemon opted into executing.
+            // A failure is surfaced at warn so a dropped mutation is visible for
+            // recovery, not erased.
+            match executed {
+                Some(ExecutionResult::Written(outcome)) => tracing::info!(
+                    behaviour = %behaviour,
+                    ?outcome,
+                    "live executor wrote the relation"
+                ),
+                Some(ExecutionResult::Failed(reason)) => tracing::warn!(
+                    behaviour = %behaviour,
+                    reason = %reason,
+                    "live executor did not complete the write"
+                ),
+                None => {}
             }
         }
         DispatchOutcome::Refused { behaviour, reason } => {

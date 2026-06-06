@@ -44,6 +44,42 @@ pub struct AgentConfig {
     /// The LLM provider for `kind: agent` behaviours, if one is configured
     /// and AI is enabled. `None` means agent behaviours cannot run.
     pub provider: Option<ProviderSettings>,
+    /// Whether the agent may **execute** proven workflow decisions (write to
+    /// the Knowledge Graph), not just surface them. Default `false`:
+    /// suggest-mode, where a decision is gated, audited, and reported but never
+    /// acted on. Opt in with `[agent] executor_live = true`; the write still
+    /// passes the full predict -> gate -> re-validate -> audit chain.
+    ///
+    /// PREREQUISITES before relying on this in a deployment (all three are why
+    /// it defaults off and nothing flips it yet):
+    ///
+    /// 1. **Execution semantics (decided).** The executor fires on a proven
+    ///    `PreviewThenExecute`, which in the capability model is the *Supervised*
+    ///    lift ("preview with a cancellation window, then execute"). For a safe,
+    ///    reversible, invisible curation action via a *deterministic workflow*
+    ///    (auto-tag's `FILE_PART_OF`), it executes **silently and immediately**,
+    ///    with no per-action prompt: per-file confirmation is annoying, and these
+    ///    workflows make no LLM call so they cost no tokens. The user inspects
+    ///    what was curated after the fact via the read-only activity view (the
+    ///    `silent curator + pull` interaction model), not a pre-action window.
+    ///    This deliberately overrides the literal Supervised window for safe
+    ///    workflow curation; it does NOT extend to `kind: agent` LLM behaviours
+    ///    (which are not wired to execute) or to high-impact / external-triggered
+    ///    actions (which always confirm regardless).
+    /// 2. **Cancellation.** The daemon's dispatch loop is cancellable (a config
+    ///    reload or shutdown drops an in-flight dispatch), which was safe while
+    ///    nothing executed. With this on, a reload/shutdown mid-write drops the
+    ///    write future. The write is audited *before* it is sent and the daemon's
+    ///    create is idempotent, so the mutation is durably recorded and
+    ///    reconcilable on the next run; the residual is the D-2 class of an
+    ///    already-sent write committing under a grant the reload was revoking.
+    ///    A non-cancellable live-write completion boundary is the fix.
+    /// 3. **Proof atomicity.** The executor re-validates the full proof, then
+    ///    performs a separate write; the daemon enforces only endpoint existence
+    ///    and edge absence atomically, not the gate's `PathUnderField`. A fact
+    ///    outside the write predicate can change in between (gap A2, needs a
+    ///    graph snapshot/version).
+    pub executor_live: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -66,6 +102,8 @@ struct RawAi {
 struct RawAgent {
     #[serde(default)]
     enabled: Vec<String>,
+    #[serde(default)]
+    executor_live: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -108,6 +146,7 @@ impl AgentConfig {
             read_tier: AccessTier::Minimal,
             actions: ActionPermissions::suggest_only(),
             provider: None,
+            executor_live: false,
         }
     }
 
@@ -161,6 +200,7 @@ impl AgentConfig {
             read_tier: access_tier_from_level(raw.ai.access_level),
             actions: ActionPermissions::new(baseline, raw.ai.autonomous_apps),
             provider,
+            executor_live: raw.agent.executor_live,
         }
     }
 }
@@ -186,6 +226,18 @@ enabled = ["auto-tag-by-project"]
         assert_eq!(cfg.enabled.get("auto-tag-by-project"), Some(&Provenance::BuiltIn));
         assert_eq!(cfg.read_tier, AccessTier::ProjectScoped);
         assert!(cfg.actions.is_autonomous("org.lunaris.files"));
+        // The executor opt-in defaults off (suggest-mode) when unspecified.
+        assert!(!cfg.executor_live);
+    }
+
+    #[test]
+    fn executor_live_is_opt_in() {
+        let cfg = AgentConfig::parse(
+            "[ai]\nenabled = true\n[agent]\nexecutor_live = true\n",
+        );
+        assert!(cfg.executor_live, "[agent] executor_live = true opts into executing");
+        // Fail-closed config never executes.
+        assert!(!AgentConfig::fail_closed().executor_live);
     }
 
     #[test]

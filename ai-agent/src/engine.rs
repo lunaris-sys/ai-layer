@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures::FutureExt as _;
-use lunaris_ai_core::capability::{AccessTier, ActionDecision};
+use lunaris_ai_core::capability::{AccessTier, ActionDecision, BaselineMode};
 use lunaris_ai_core::provider::{AIProvider, CompletionRequest};
 
 use crate::agentic::{build_agent_prompt, external_screen_text, parse_agent_step, AgentStep};
@@ -159,6 +159,20 @@ pub trait WorkflowHandler: Send + Sync {
 /// Maps a behaviour manifest's `handler` id to its code handler.
 pub type HandlerRegistry = BTreeMap<String, Box<dyn WorkflowHandler>>;
 
+/// What the live executor did with a proven decision, carried on
+/// [`DispatchOutcome::Decided`] so a write failure is surfaced rather than
+/// erased. Only ever set when the daemon opted into executing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionResult {
+    /// The authorised write was performed; the variant records whether the edge
+    /// was created or already present.
+    Written(crate::executor::WriteOutcome),
+    /// Execution was refused or failed (a stale proof, an audit outage, a write
+    /// error). The reason is for logging and recovery; the attempt, if it
+    /// reached the write, was audited beforehand regardless.
+    Failed(String),
+}
+
 /// The outcome of dispatching one matched behaviour for one event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchOutcome {
@@ -190,6 +204,14 @@ pub enum DispatchOutcome {
         /// time (obligation 2), since the report does not carry the point-in-time
         /// preconditions (e.g. `PathUnderField`) that justified the lift.
         dry_run: Option<DryRunReport>,
+        /// What the live executor did with this decision, when the daemon opted
+        /// into executing. `None` in suggest-mode (no executor) or for a
+        /// non-executing decision; `Some(Written)` when the authorised write was
+        /// performed; `Some(Failed)` when execution was refused or failed (a
+        /// stale proof, an audit outage, a write error) so the failure is not
+        /// erased but surfaced for logging and recovery. The act, when attempted,
+        /// is audited before the write regardless of this outcome.
+        executed: Option<ExecutionResult>,
     },
     /// The handler reached a terminal condition with no action.
     Terminal {
@@ -366,6 +388,13 @@ pub struct Dispatcher<'a> {
     /// is refused before its handler runs.
     read_tier: AccessTier,
     gate: Gate<'a>,
+    /// The live action executor, present only when the daemon opts into
+    /// executing (default off: suggest-mode, nothing is written). When set, a
+    /// proven `PreviewThenExecute` workflow decision is executed after the gate
+    /// records it: the executor re-validates against the current graph and
+    /// performs the authorised, audited write. `None` leaves the loop in
+    /// suggest-mode, where the decision is surfaced but never acted on.
+    executor: Option<crate::executor::LiveExecutor<'a>>,
     /// The LLM provider the bounded agent loop drives. `None` when no
     /// provider is configured, in which case `kind: agent` behaviours are
     /// skipped (workflow behaviours never need one).
@@ -445,6 +474,7 @@ impl<'a> Dispatcher<'a> {
             graph,
             read_tier,
             gate,
+            executor: None,
             provider,
             clock,
             compaction: CompactionPolicy::default(),
@@ -452,6 +482,15 @@ impl<'a> Dispatcher<'a> {
             screening: ScreeningMode::Off,
             screen_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }
+    }
+
+    /// Opt into executing proven workflow decisions through the given live
+    /// executor. Without this the dispatcher stays in suggest-mode: a decision
+    /// is gated, audited, and surfaced, but nothing is written. The daemon sets
+    /// this only when its config enables the executor.
+    pub fn with_executor(mut self, executor: crate::executor::LiveExecutor<'a>) -> Self {
+        self.executor = Some(executor);
+        self
     }
 
     /// Override the context-compaction policy (e.g. with the real model's
@@ -776,6 +815,20 @@ impl<'a> Dispatcher<'a> {
                         let tool_scope = m.tools.get(&action.tool).map(Vec::as_slice).unwrap_or(&[]);
                         let dry_run =
                             plan_dry_run(&behaviour, &action, receipt.decision, tool_scope);
+                        // If the daemon opted into executing, act on a proven
+                        // decision now (re-validate + audited write). Suggest-mode
+                        // (no executor) skips this and only surfaces the decision.
+                        let executed = self
+                            .maybe_execute(
+                                &behaviour,
+                                &action,
+                                receipt.decision,
+                                tool_scope,
+                                graph,
+                                &ctx,
+                                m.mode,
+                            )
+                            .await;
                         let plan = plan_for(&action.tool);
                         DispatchOutcome::Decided {
                             behaviour,
@@ -785,6 +838,7 @@ impl<'a> Dispatcher<'a> {
                             audit_index: receipt.audit_index,
                             plan,
                             dry_run,
+                            executed,
                         }
                     }
                     Err(e) => DispatchOutcome::Refused {
@@ -792,6 +846,55 @@ impl<'a> Dispatcher<'a> {
                         reason: e.to_string(),
                     },
                 }
+            }
+        }
+    }
+
+    /// Execute a gated workflow decision when the daemon opted into executing.
+    /// In suggest-mode (`executor` is `None`) this returns `None`. Otherwise the
+    /// executor re-validates the proof against the current graph and performs the
+    /// authorised, audited write; the result is returned so it is carried on the
+    /// dispatch outcome (a write failure is surfaced, not erased) and logged.
+    ///
+    /// NB this executes a proven `PreviewThenExecute` **immediately**, with no
+    /// preview or cancellation window: the decided silent-curator semantics for a
+    /// safe reversible workflow curation action (per-file prompts are annoying
+    /// and these workflows cost no tokens; the user inspects results via the pull
+    /// activity view). See the `executor_live` config doc; the cancellation and
+    /// proof-atomicity gaps there still gate flipping the flag in a deployment.
+    async fn maybe_execute(
+        &self,
+        behaviour: &str,
+        action: &ProposedAction,
+        decision: ActionDecision,
+        tool_scope: &[String],
+        graph: &dyn GraphHandle,
+        ctx: &ActionContext<'_>,
+        ceiling: BaselineMode,
+    ) -> Option<ExecutionResult> {
+        let executor = self.executor.as_ref()?;
+        match executor
+            .execute(action, decision, tool_scope, graph, behaviour, ctx, ceiling)
+            .await
+        {
+            Ok(Some(written)) => {
+                tracing::info!(
+                    behaviour = %behaviour,
+                    write = ?written.write,
+                    outcome = ?written.outcome,
+                    "live executor performed the authorised write"
+                );
+                Some(ExecutionResult::Written(written.outcome))
+            }
+            // A non-executing decision (the executor planned nothing): nothing
+            // to record beyond the decision itself.
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    behaviour = %behaviour,
+                    "live executor did not write: {e}"
+                );
+                Some(ExecutionResult::Failed(e.to_string()))
             }
         }
     }
@@ -1080,6 +1183,10 @@ impl<'a> Dispatcher<'a> {
                                 audit_index: receipt.audit_index,
                                 plan,
                                 dry_run,
+                                // The multi-step agent loop is not wired to the
+                                // executor (separate design pass); it never
+                                // executes here.
+                                executed: None,
                             });
                             ProgressKey::Accepted(tool_name, summary_text)
                         }
@@ -1289,6 +1396,25 @@ mod tests {
 name: auto-tag-by-project
 description: Tag a newly opened file with the project it belongs to.
 kind: workflow
+handler: auto_tag_by_project
+reads: project
+trigger:
+  type: event
+  event: file.opened
+  filter: "path not_startswith ~/.cache"
+tools:
+  graph.write: [Project, FILE_PART_OF]
+---
+"#;
+
+    /// Like `AUTO_TAG` but `mode: supervised`, so a proven decision lifts to
+    /// `PreviewThenExecute` (the executing path the live executor acts on)
+    /// instead of being capped to `Propose` by a Suggest ceiling.
+    const LIVE_AUTO_TAG: &str = r#"---
+name: auto-tag-by-project
+description: Tag a newly opened file with the project it belongs to.
+kind: workflow
+mode: supervised
 handler: auto_tag_by_project
 reads: project
 trigger:
@@ -1630,6 +1756,7 @@ tools:
                 audit_index: 0,
                 plan: plan_for("graph.write"),
                 dry_run: None,
+                executed: None,
             }
         );
         let recorded = audit.recorded().await;
@@ -1761,6 +1888,7 @@ tools:
                 audit_index: 0,
                 plan: plan_for("graph.write"),
                 dry_run: None,
+                executed: None,
             }
         );
     }
@@ -3089,5 +3217,207 @@ trigger:
         assert_eq!(output_window_cap(window, 100, 600), 100);
         // Input alone fills the window: no output room.
         assert_eq!(output_window_cap(window, 800, 1200), 0);
+    }
+
+    // ---- Live executor wired into the dispatch loop ----
+
+    use crate::executor::{LiveExecutor, RelationWrite, RelationWriter, WriteError, WriteOutcome};
+    use crate::slice::{PathResolver, SliceError, StaticMountPolicy};
+
+    /// A graph shaped like the proof for tagging `/proj/a.rs` to `p1`, unlinked
+    /// so the prediction is valid (the same needles the gate/executor query).
+    struct TagGraph;
+    #[async_trait::async_trait]
+    impl GraphHandle for TagGraph {
+        async fn query(
+            &self,
+            cypher: &str,
+        ) -> Result<Vec<HashMap<String, serde_json::Value>>, GraphError> {
+            let row = |pairs: &[(&str, serde_json::Value)]| -> HashMap<String, serde_json::Value> {
+                pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+            };
+            if cypher.contains("n:File {id: '/proj/a.rs'}") {
+                Ok(vec![row(&[("id", "/proj/a.rs".into()), ("path", "/proj/a.rs".into())])])
+            } else if cypher.contains("n:Project {id: 'p1'}") {
+                Ok(vec![row(&[("id", "p1".into()), ("root_path", "/proj".into())])])
+            } else if cypher.contains("count(*) AS cnt") {
+                Ok(vec![row(&[("cnt", serde_json::Value::from(0_i64))])])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Accepts an already-canonical absolute path as itself.
+    struct IdResolver;
+    impl PathResolver for IdResolver {
+        fn resolve(&self, raw: &str) -> Result<String, SliceError> {
+            if raw.starts_with('/') {
+                Ok(raw.to_string())
+            } else {
+                Err(SliceError::PathResolve {
+                    raw: raw.to_string(),
+                    reason: "not absolute".to_string(),
+                })
+            }
+        }
+    }
+
+    /// Proposes the provable FILE_PART_OF tag (operands matching `TagGraph`).
+    struct ProvableTag;
+    #[async_trait::async_trait]
+    impl WorkflowHandler for ProvableTag {
+        async fn run(
+            &self,
+            _event: &AgentEvent,
+            _graph: &dyn GraphHandle,
+        ) -> Result<HandlerOutcome, HandlerError> {
+            Ok(HandlerOutcome::Propose(ProposedAction {
+                tool: "graph.write".to_string(),
+                summary: "tag /proj/a.rs as part of p1".to_string(),
+                arguments: BTreeMap::from([
+                    ("file".to_string(), "/proj/a.rs".to_string()),
+                    ("project".to_string(), "p1".to_string()),
+                ]),
+            }))
+        }
+    }
+
+    /// Records each write without performing I/O.
+    #[derive(Default)]
+    struct RecordingWriter(std::sync::Mutex<Vec<RelationWrite>>);
+    #[async_trait::async_trait]
+    impl RelationWriter for RecordingWriter {
+        async fn write_relation(&self, write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+            self.0.lock().unwrap().push(write.clone());
+            Ok(WriteOutcome::Created)
+        }
+    }
+
+    /// A capability that lifts a proven Ordinary action to `PreviewThenExecute`
+    /// for the agent's own app id (the id the dispatcher decides under).
+    fn live_cap() -> Capability {
+        Capability::new(
+            AccessTier::Full,
+            ActionPermissions::new(BaselineMode::Suggest, [AGENT_APP_ID]),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_opted_in_executor_performs_and_audits_a_proven_workflow_write() {
+        let behaviours = [loaded(LIVE_AUTO_TAG, Status::Enabled)];
+        let handlers = registry(Box::new(ProvableTag));
+        let cap = live_cap();
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = TagGraph;
+        let resolver = IdResolver;
+        let mounts = StaticMountPolicy::empty();
+        let writer = RecordingWriter::default();
+
+        let g = Gate::new(&cap, &audit, &obs, &resolver, &mounts);
+        let executor = LiveExecutor::new(&cap, &resolver, &mounts, &writer, &audit);
+        let d = Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, g, None, &TEST_CLOCK)
+            .with_executor(executor);
+
+        let outcomes = d.dispatch(&event("/proj/a.rs")).await;
+
+        // The decision lifted to PreviewThenExecute and the execution result is
+        // carried on the outcome (here a `Created` write), not erased.
+        match outcomes.as_slice() {
+            [DispatchOutcome::Decided { decision, executed, .. }] => {
+                assert_eq!(*decision, ActionDecision::PreviewThenExecute);
+                assert_eq!(
+                    *executed,
+                    Some(ExecutionResult::Written(WriteOutcome::Created)),
+                    "the execution result is surfaced on the outcome"
+                );
+            }
+            other => panic!("expected one Decided/PreviewThenExecute, got {other:?}"),
+        }
+        // ...and the opted-in executor performed the write.
+        let written = writer.0.lock().unwrap();
+        assert_eq!(written.len(), 1, "the executor wrote the relation");
+        assert_eq!(written[0].relation_type, "FILE_PART_OF");
+        assert_eq!(written[0].to_type, "system.Project");
+
+        // Both the gate decision and the execution are on the ledger, correlated.
+        let entries = audit.recorded().await;
+        assert_eq!(entries.len(), 2, "decision + execution are both audited");
+        let labels: Vec<&str> = entries.iter().map(|e| e.structural.outcome.as_str()).collect();
+        // The gate records `<decision>:<reason>` (e.g. preview-then-execute:proven-reversible);
+        // the executor records the fixed `execute`.
+        assert!(
+            labels.iter().any(|l| l.starts_with("preview-then-execute")),
+            "the decision is audited, got {labels:?}"
+        );
+        assert!(labels.contains(&"execute"), "the execution is audited, got {labels:?}");
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.call_chain_id.as_deref() == Some("e1:auto-tag-by-project")),
+            "decision and execution share one correlation id"
+        );
+    }
+
+    /// A writer that always fails, to prove a write failure is surfaced.
+    struct FailingWriter;
+    #[async_trait::async_trait]
+    impl RelationWriter for FailingWriter {
+        async fn write_relation(&self, _write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+            Err(WriteError::Failed("daemon unreachable".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_live_write_is_surfaced_not_erased() {
+        let behaviours = [loaded(LIVE_AUTO_TAG, Status::Enabled)];
+        let handlers = registry(Box::new(ProvableTag));
+        let cap = live_cap();
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = TagGraph;
+        let resolver = IdResolver;
+        let mounts = StaticMountPolicy::empty();
+        let writer = FailingWriter;
+
+        let g = Gate::new(&cap, &audit, &obs, &resolver, &mounts);
+        let executor = LiveExecutor::new(&cap, &resolver, &mounts, &writer, &audit);
+        let d = Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, g, None, &TEST_CLOCK)
+            .with_executor(executor);
+
+        let outcomes = d.dispatch(&event("/proj/a.rs")).await;
+        match outcomes.as_slice() {
+            [DispatchOutcome::Decided { executed: Some(ExecutionResult::Failed(reason)), .. }] => {
+                assert!(reason.contains("daemon unreachable"), "the failure reason is surfaced: {reason}");
+            }
+            other => panic!("expected a Decided carrying a Failed execution, got {other:?}"),
+        }
+        // The act was still audited before the write was attempted (S13): the
+        // decision entry plus the pre-write execution entry are both present.
+        assert_eq!(audit.recorded().await.len(), 2, "decision + attempted execution audited");
+    }
+
+    #[tokio::test]
+    async fn suggest_mode_dispatch_writes_nothing() {
+        // No executor attached (the default): the same proven decision is
+        // surfaced and audited, but the graph is never written.
+        let behaviours = [loaded(LIVE_AUTO_TAG, Status::Enabled)];
+        let handlers = registry(Box::new(ProvableTag));
+        let cap = live_cap();
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = TagGraph;
+        let resolver = IdResolver;
+        let mounts = StaticMountPolicy::empty();
+
+        let g = Gate::new(&cap, &audit, &obs, &resolver, &mounts);
+        let d = Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, g, None, &TEST_CLOCK);
+        let outcomes = d.dispatch(&event("/proj/a.rs")).await;
+
+        assert!(matches!(outcomes.as_slice(), [DispatchOutcome::Decided { .. }]));
+        let entries = audit.recorded().await;
+        assert_eq!(entries.len(), 1, "suggest-mode audits only the decision, no execution");
+        assert!(entries[0].structural.outcome.starts_with("preview-then-execute"));
     }
 }
