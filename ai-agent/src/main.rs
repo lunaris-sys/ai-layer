@@ -937,6 +937,11 @@ fn log_dispatch_outcome(outcome: &DispatchOutcome) {
                     reason = %reason,
                     "live executor did not complete the write"
                 ),
+                Some(ExecutionResult::Indeterminate(reason)) => tracing::warn!(
+                    behaviour = %behaviour,
+                    reason = %reason,
+                    "live executor write outcome is unknown; reconciled on the next run"
+                ),
                 None => {}
             }
         }

@@ -167,10 +167,17 @@ pub enum ExecutionResult {
     /// The authorised write was performed; the variant records whether the edge
     /// was created or already present.
     Written(crate::executor::WriteOutcome),
-    /// Execution was refused or failed (a stale proof, an audit outage, a write
-    /// error). The reason is for logging and recovery; the attempt, if it
-    /// reached the write, was audited beforehand regardless.
+    /// Execution was refused or definitely did not write (a stale proof, an
+    /// audit outage, a pre-send write error). The reason is for logging and
+    /// recovery; the attempt, if it reached the write, was audited beforehand.
     Failed(String),
+    /// The write timed out after the request may already have been sent, so it
+    /// is **unknown** whether the daemon committed the relation. NOT a failure:
+    /// reporting it as one would lose the authoritative created/exists signal for
+    /// a write that did commit. It is pre-audited, and the executor's
+    /// re-validation reconciles it on the next run (a committed edge fails the
+    /// `Not(EdgeExists)` proof, so it is neither double-written nor lost).
+    Indeterminate(String),
 }
 
 /// The outcome of dispatching one matched behaviour for one event.
@@ -889,6 +896,17 @@ impl<'a> Dispatcher<'a> {
             // A non-executing decision (the executor planned nothing): nothing
             // to record beyond the decision itself.
             Ok(None) => None,
+            // A timed-out write may have committed, so it is indeterminate, not a
+            // failure: mapping it to Failed would discard the created/exists
+            // signal for a write that did persist. The next run's re-validation
+            // reconciles it.
+            Err(e @ crate::executor::ExecError::WriteTimeout) => {
+                tracing::warn!(
+                    behaviour = %behaviour,
+                    "live executor write timed out (commit unknown): {e}"
+                );
+                Some(ExecutionResult::Indeterminate(e.to_string()))
+            }
             Err(e) => {
                 tracing::warn!(
                     behaviour = %behaviour,
@@ -3366,6 +3384,41 @@ trigger:
     impl RelationWriter for FailingWriter {
         async fn write_relation(&self, _write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
             Err(WriteError::Failed("daemon unreachable".to_string()))
+        }
+    }
+
+    /// A writer that never returns, to exercise the write timeout end to end.
+    struct HangingWriter;
+    #[async_trait::async_trait]
+    impl RelationWriter for HangingWriter {
+        async fn write_relation(&self, _write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_live_write_is_indeterminate_not_failed() {
+        let behaviours = [loaded(LIVE_AUTO_TAG, Status::Enabled)];
+        let handlers = registry(Box::new(ProvableTag));
+        let cap = live_cap();
+        let audit = MockAuditSink::accepting();
+        let obs = NullObserver;
+        let graph = TagGraph;
+        let resolver = IdResolver;
+        let mounts = StaticMountPolicy::empty();
+        let writer = HangingWriter;
+
+        let g = Gate::new(&cap, &audit, &obs, &resolver, &mounts);
+        let executor = LiveExecutor::new(&cap, &resolver, &mounts, &writer, &audit);
+        let d = Dispatcher::new(&behaviours, &handlers, &graph, AccessTier::Full, g, None, &TEST_CLOCK)
+            .with_executor(executor);
+
+        // Paused time advances past the write timeout once the write is the only
+        // pending work, so this resolves immediately.
+        let outcomes = d.dispatch(&event("/proj/a.rs")).await;
+        match outcomes.as_slice() {
+            [DispatchOutcome::Decided { executed: Some(ExecutionResult::Indeterminate(_)), .. }] => {}
+            other => panic!("a timed-out write must be Indeterminate, not Failed: {other:?}"),
         }
     }
 
