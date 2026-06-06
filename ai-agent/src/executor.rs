@@ -127,6 +127,22 @@ pub enum WriteError {
     Failed(String),
 }
 
+/// Whether a write created the edge or found it already present. The daemon's
+/// conditional create reports this atomically for a single attempt (and never
+/// double-creates). It is NOT durable across an at-least-once retry: a create
+/// whose response is lost and is retried reports `AlreadyExists` the second
+/// time, so this alone does not make a compensator that survives retries safe.
+/// Durable operation identity (an idempotency key) is the deferred follow-up;
+/// the executor's pre-write re-validation is the interim guard (a retry whose
+/// edge now exists fails its proof and writes nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// This write created the edge.
+    Created,
+    /// The edge already existed; the write was an idempotent no-op.
+    AlreadyExists,
+}
+
 /// The seam through which the live executor performs an authorised write. The
 /// production impl wraps the os-sdk graph write client (the knowledge daemon's
 /// write socket); tests inject a mock that records the write without I/O. Kept
@@ -134,9 +150,21 @@ pub enum WriteError {
 /// and a writer is only ever reached after a re-validated proof.
 #[async_trait]
 pub trait RelationWriter: Send + Sync {
-    /// Persist the relation. Idempotent at the daemon (MERGE), so a transport
-    /// retry re-confirms rather than duplicates.
-    async fn write_relation(&self, write: &RelationWrite) -> Result<(), WriteError>;
+    /// Persist the relation, reporting whether it created the edge or found it
+    /// already present. Idempotent at the daemon (a strict conditional create),
+    /// so a transport retry re-confirms (`AlreadyExists`) rather than duplicates.
+    async fn write_relation(&self, write: &RelationWrite) -> Result<WriteOutcome, WriteError>;
+}
+
+/// A write the live executor performed: the relation and whether it was created
+/// or already present. Returned so a caller (and future compensation) acts only
+/// on a real create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutedWrite {
+    /// The relation that was written.
+    pub write: RelationWrite,
+    /// Whether this call created the edge or found it present.
+    pub outcome: WriteOutcome,
 }
 
 /// What a dry run would do, surfaced for logging / the activity view. Holds the
@@ -363,14 +391,16 @@ impl<'a> LiveExecutor<'a> {
     /// behaviour-scoped one, so the re-validation reads no more than the
     /// behaviour may.
     ///
-    /// The re-validation **narrows** the staleness window but does not yet make
-    /// the check atomic with the write (obligation 2 is not fully closed here): a
-    /// `PathUnderField` / `Not(EdgeExists)` fact can still change between the
-    /// re-check and the writer's `MERGE`, which idempotently succeeds even if the
-    /// edge already exists. Closing it fully needs a daemon-side conditional
-    /// create-or-conflict that reports whether it actually created the edge (so
-    /// compensation never retracts a pre-existing one); that daemon op is the
-    /// next increment and is why nothing wires this into a live run yet.
+    /// The edge create itself is atomic and reports whether it created the edge:
+    /// the daemon's conditional create is a single statement on its serial graph
+    /// thread, so it cannot double-create and tells the writer `Created` vs
+    /// `AlreadyExists` (so compensation only ever undoes a real create). What the
+    /// re-validation **narrows but does not** make atomic is the rest of the
+    /// proof: a `PathUnderField` fact (the file still lies under the project
+    /// root) can change between this re-check and the write, since the daemon's
+    /// create enforces only endpoint existence and edge absence, not the agent's
+    /// path-prefix predicate. Fully closing that needs a graph snapshot/version
+    /// the engine does not expose (gap A2); it is why nothing wires this live yet.
     pub async fn execute(
         &self,
         action: &ProposedAction,
@@ -380,7 +410,7 @@ impl<'a> LiveExecutor<'a> {
         app_id: &str,
         external_trigger: bool,
         ceiling: BaselineMode,
-    ) -> Result<Option<RelationWrite>, ExecError> {
+    ) -> Result<Option<ExecutedWrite>, ExecError> {
         // Plan: only a proven PreviewThenExecute yields a write, and the planned
         // write is checked against the behaviour's declared scope (obligation 3).
         let Some(report) = dry_run(action, decision, tool_scope)? else {
@@ -422,12 +452,18 @@ impl<'a> LiveExecutor<'a> {
             return Err(ExecError::ProofStale);
         }
 
-        // The proof still holds: perform the authorised write.
-        self.writer
+        // The proof still holds: perform the authorised write. The outcome
+        // (created vs already-present) is carried back so only a real create is
+        // ever compensated.
+        let outcome = self
+            .writer
             .write_relation(&report.write)
             .await
             .map_err(|e| ExecError::Write(e.to_string()))?;
-        Ok(Some(report.write))
+        Ok(Some(ExecutedWrite {
+            write: report.write,
+            outcome,
+        }))
     }
 }
 
@@ -646,9 +682,9 @@ mod tests {
 
     #[async_trait]
     impl RelationWriter for MockWriter {
-        async fn write_relation(&self, write: &RelationWrite) -> Result<(), WriteError> {
+        async fn write_relation(&self, write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
             self.0.lock().unwrap().push(write.clone());
-            Ok(())
+            Ok(WriteOutcome::Created)
         }
     }
 
@@ -670,8 +706,10 @@ mod tests {
                 BaselineMode::Supervised,
             )
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(written.unwrap().relation_type, "FILE_PART_OF");
+        assert_eq!(written.write.relation_type, "FILE_PART_OF");
+        assert_eq!(written.outcome, WriteOutcome::Created);
         let recorded = writer.0.lock().unwrap();
         assert_eq!(recorded.len(), 1, "exactly one write performed");
         assert_eq!(recorded[0].to_type, "system.Project");

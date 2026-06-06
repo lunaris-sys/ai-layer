@@ -8,9 +8,9 @@
 
 use std::collections::HashMap;
 
-use os_sdk::UnixGraphClient;
+use os_sdk::{RelationWriteOutcome, UnixGraphClient};
 
-use crate::executor::{RelationWrite, RelationWriter, WriteError};
+use crate::executor::{RelationWrite, RelationWriter, WriteError, WriteOutcome};
 use crate::seams::{GraphError, GraphHandle};
 
 /// The knowledge daemon's query socket. The daemon resolves the real path
@@ -80,8 +80,8 @@ impl UnixRelationWriter {
 
 #[async_trait::async_trait]
 impl RelationWriter for UnixRelationWriter {
-    async fn write_relation(&self, write: &RelationWrite) -> Result<(), WriteError> {
-        UnixGraphClient::new(self.socket_path.clone())
+    async fn write_relation(&self, write: &RelationWrite) -> Result<WriteOutcome, WriteError> {
+        let outcome = UnixGraphClient::new(self.socket_path.clone())
             .create_relation(
                 &write.from_type,
                 &write.from_id,
@@ -90,6 +90,10 @@ impl RelationWriter for UnixRelationWriter {
                 &write.relation_type,
             )
             .await
-            .map_err(|e| WriteError::Failed(e.to_string()))
+            .map_err(|e| WriteError::Failed(e.to_string()))?;
+        Ok(match outcome {
+            RelationWriteOutcome::Created => WriteOutcome::Created,
+            RelationWriteOutcome::AlreadyExists => WriteOutcome::AlreadyExists,
+        })
     }
 }
